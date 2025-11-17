@@ -1,0 +1,76 @@
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+from graphrag.config import Settings
+from graphrag.db import schema
+from graphrag.db.connection import connect
+from graphrag.db.repository import MetadataRepository
+from graphrag.mcp import server as mcp_server
+from graphrag.models.records import EntityRecord, MemberRecord
+
+
+def build_entity(file_path: Path) -> EntityRecord:
+    member = MemberRecord(
+        name="greet",
+        kind="function",
+        signature="func greet() -> String",
+        code="func greet() -> String { return \"hi\" }",
+        start_line=5,
+        end_line=7,
+    )
+    return EntityRecord(
+        name="Greeter",
+        kind="struct",
+        module="Sources",
+        language="swift",
+        file_path=file_path,
+        start_line=1,
+        end_line=10,
+        signature="struct Greeter",
+        code="struct Greeter {}",
+        stable_id="stable-greeter",
+        members=[member],
+    )
+
+
+def seed_db(db_path: Path) -> None:
+    conn = connect(db_path)
+    schema.apply_schema(conn)
+    repo = MetadataRepository(conn)
+    commit_id = repo.record_commit("abc123", None, "master", True)
+    repo.persist_entities(commit_id, [build_entity(Path("Sources/Greeter.swift"))])
+    conn.commit()
+    conn.close()
+
+
+def test_mcp_tools_resolve_entities_and_members(tmp_path):
+    db_path = tmp_path / "mcp.db"
+    seed_db(db_path)
+    settings = Settings(repo_path=tmp_path, db_path=db_path)
+    original = mcp_server.runtime_settings
+    mcp_server.runtime_settings = settings
+    try:
+        entities = asyncio.run(
+            mcp_server.handle_call_tool(
+            "find_entities", {"query": "Greeter", "include_code": False}
+        )
+        )
+        payload = json.loads(entities[0].text)
+        assert payload["count"] == 1
+        assert payload["entities"][0]["name"] == "Greeter"
+
+        members = asyncio.run(
+            mcp_server.handle_call_tool(
+                "get_members",
+                {"entities": ["Greeter"], "members": ["greet"], "include_code": True},
+            )
+        )
+        member_payload = json.loads(members[0].text)
+        assert member_payload["count"] == 1
+        assert member_payload["members"][0]["member_name"] == "greet"
+    finally:
+        mcp_server.runtime_settings = original
+
