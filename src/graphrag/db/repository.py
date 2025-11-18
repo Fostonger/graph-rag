@@ -4,9 +4,9 @@ import json
 from dataclasses import dataclass
 import sqlite3
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
-from ..models.records import EntityRecord, MemberRecord
+from ..models.records import EntityRecord, MemberRecord, RelationshipRecord
 
 
 @dataclass
@@ -219,6 +219,7 @@ class MetadataRepository:
                     """,
                     (member_id, commit_id, file_id),
                 )
+            self._tombstone_relationships([entity_id], commit_id)
 
         self.conn.execute(
             "DELETE FROM entity_files WHERE file_id = ?",
@@ -312,16 +313,147 @@ class MetadataRepository:
         self,
         commit_id: int,
         records: Iterable[EntityRecord],
-    ) -> None:
+    ) -> Dict[str, int]:
+        id_map: Dict[str, int] = {}
         for record in records:
             file_id = self.ensure_file(record.file_path, record.language)
             entity_id = self.upsert_entity(record, file_id)
+            id_map[record.stable_id] = entity_id
             self.record_entity_version(entity_id, commit_id, file_id, record)
             for member in record.members:
                 member_id = self.upsert_member(entity_id, member)
                 self.record_member_version(member_id, commit_id, file_id, member)
+        return id_map
+
+    def persist_relationships(
+        self,
+        commit_id: int,
+        entity_id_map: Dict[str, int],
+        relationships: Iterable[RelationshipRecord],
+    ) -> None:
+        rel_list = list(relationships)
+        if not entity_id_map and not rel_list:
+            return
+        source_ids = list({entity_id for entity_id in entity_id_map.values()})
+        self._tombstone_relationships(source_ids, commit_id)
+        target_cache: Dict[Tuple[str, Optional[str]], Optional[int]] = {}
+        for rel in rel_list:
+            source_id = entity_id_map.get(rel.source_stable_id)
+            if source_id is None:
+                continue
+            target_key = (rel.target_name, rel.target_module)
+            if target_key not in target_cache:
+                target_cache[target_key] = self._lookup_entity_id(
+                    rel.target_name, rel.target_module
+                )
+            target_id = target_cache[target_key]
+            self._insert_relationship(
+                source_entity_id=source_id,
+                target_entity_id=target_id,
+                target_name=rel.target_name,
+                target_module=rel.target_module,
+                edge_type=rel.edge_type,
+                metadata=rel.metadata,
+                commit_id=commit_id,
+                is_deleted=False,
+            )
 
     # --- internal ---
     def _member_stable_id(self, entity_id: int, member: MemberRecord) -> str:
         return f"{entity_id}:{member.kind}:{member.name}"
+
+    def _lookup_entity_id(self, name: str, module: Optional[str]) -> Optional[int]:
+        if module:
+            row = self.conn.execute(
+                """
+                SELECT id FROM entities
+                WHERE name = ? AND module = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (name, module),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT id FROM entities
+                WHERE name = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (name,),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
+    def _tombstone_relationships(
+        self, source_entity_ids: Sequence[int], commit_id: int
+    ) -> None:
+        if not source_entity_ids:
+            return
+        placeholders = ",".join("?" for _ in source_entity_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                target_module,
+                edge_type,
+                metadata
+            FROM entity_relationships
+            WHERE source_entity_id IN ({placeholders})
+              AND is_deleted = 0
+            """,
+            tuple(source_entity_ids),
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            self._insert_relationship(
+                source_entity_id=int(row["source_entity_id"]),
+                target_entity_id=int(row["target_entity_id"])
+                if row["target_entity_id"] is not None
+                else None,
+                target_name=row["target_name"],
+                target_module=row["target_module"],
+                edge_type=row["edge_type"],
+                metadata=metadata,
+                commit_id=commit_id,
+                is_deleted=True,
+            )
+
+    def _insert_relationship(
+        self,
+        source_entity_id: int,
+        target_entity_id: Optional[int],
+        target_name: str,
+        target_module: Optional[str],
+        edge_type: str,
+        metadata: dict,
+        commit_id: int,
+        is_deleted: bool,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO entity_relationships (
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                target_module,
+                edge_type,
+                metadata,
+                commit_id,
+                is_deleted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                target_module,
+                edge_type,
+                json.dumps(metadata, sort_keys=True) if metadata else None,
+                commit_id,
+                int(is_deleted),
+            ),
+        )
 

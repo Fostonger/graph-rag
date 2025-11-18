@@ -44,7 +44,7 @@ def init(
     """Perform a first-time full index of the repository."""
 
     settings = _resolve_settings(config, repo, db, feature_db)
-    registry = build_registry(settings.languages)
+    registry = build_registry(settings)
     service = IndexerService(settings, registry=registry)
     head_hash = service.initialize()
     console.print(f"[green]Indexed HEAD commit[/green] {head_hash}")
@@ -60,7 +60,7 @@ def update(
     """Apply incremental updates since the last indexed master commit."""
 
     settings = _resolve_settings(config, repo, db, feature_db)
-    registry = build_registry(settings.languages)
+    registry = build_registry(settings)
     service = IndexerService(settings, registry=registry)
     commits = service.update()
     if not commits:

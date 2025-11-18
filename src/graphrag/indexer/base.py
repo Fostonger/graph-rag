@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Iterable
 
-from ..models.records import EntityRecord
+from ..models.records import ParsedSource
 
 
 class ParserAdapter(ABC):
     language: str
 
     @abstractmethod
-    def parse(self, source: str, path: Path) -> Iterable[EntityRecord]:
-        """Return entity records discovered in the given source."""
+    def parse(self, source: str, path: Path) -> ParsedSource:
+        """Return parsed entities and relationships discovered in the given source."""
 
 
 class ParserRegistry:

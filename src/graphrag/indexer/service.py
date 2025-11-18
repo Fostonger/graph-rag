@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
 from git import Repo
 
@@ -9,7 +9,7 @@ from ..config import Settings
 from ..db import schema
 from ..db.connection import get_connection
 from ..db.repository import MetadataRepository
-from ..models.records import EntityRecord
+from ..models.records import ParsedSource
 from .base import ParserRegistry
 from .git_utils import (
     changed_swift_files,
@@ -25,7 +25,7 @@ class IndexerService:
     def __init__(self, settings: Settings, registry: ParserRegistry | None = None) -> None:
         self.settings = settings
         self.repo: Repo = open_repo(settings.repo_path)
-        self.registry = registry or build_registry(settings.languages)
+        self.registry = registry or build_registry(settings)
 
     # --- public API ---
     def initialize(self) -> str:
@@ -44,8 +44,9 @@ class IndexerService:
                 content = file_content_at_commit(self.repo, head, rel_path)
                 if not content:
                     continue
-                records = self._parse_file(content, Path(rel_path))
-                store.persist_entities(commit_id, records)
+                parsed = self._parse_file(content, Path(rel_path))
+                entity_ids = store.persist_entities(commit_id, parsed.entities)
+                store.persist_relationships(commit_id, entity_ids, parsed.relationships)
         return head.hexsha
 
     def update(self) -> List[str]:
@@ -73,13 +74,16 @@ class IndexerService:
                     if content is None:
                         store.mark_entities_deleted_for_file(path_obj, commit_id)
                         continue
-                    records = self._parse_file(content, path_obj)
-                    store.persist_entities(commit_id, records)
+                    parsed = self._parse_file(content, path_obj)
+                    entity_ids = store.persist_entities(commit_id, parsed.entities)
+                    store.persist_relationships(
+                        commit_id, entity_ids, parsed.relationships
+                    )
                 processed.append(commit.hexsha)
         return processed
 
     # --- helpers ---
-    def _parse_file(self, content: str, relative_path: Path) -> Iterable[EntityRecord]:
+    def _parse_file(self, content: str, relative_path: Path) -> ParsedSource:
         adapter = self.registry.get("swift")
         return adapter.parse(content, relative_path)
 
@@ -88,10 +92,10 @@ class IndexerService:
         return [line.strip() for line in files.splitlines() if line.strip()]
 
 
-def build_registry(languages: Iterable[str]) -> ParserRegistry:
+def build_registry(settings: Settings) -> ParserRegistry:
     registry = ParserRegistry()
-    langs = set(languages)
+    langs = set(settings.languages)
     if "swift" in langs:
-        registry.register(SwiftParser())
+        registry.register(SwiftParser(project_root=settings.repo_path))
     return registry
 

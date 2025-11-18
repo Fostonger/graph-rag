@@ -11,7 +11,8 @@ def load_fixture(name: str) -> str:
 def test_swift_parser_extracts_entities_and_members():
     parser = SwiftParser()
     source = load_fixture("Sample.swift")
-    records = list(parser.parse(source, Path("Sources/Greeter.swift")))
+    parsed = parser.parse(source, Path("Sources/Greeter.swift"))
+    records = parsed.entities
 
     greeter = next(
         (r for r in records if r.name == "Greeter" and r.kind != "extension"), None
@@ -28,4 +29,65 @@ def test_swift_parser_extracts_entities_and_members():
     assert extension.extended_type == "Greeter"
     assert len(extension.members) == 1
     assert extension.members[0].name == "excitedGreeting"
+
+
+def test_swift_parser_relationships_and_module_resolution(tmp_path):
+    project_dir = tmp_path / "Features" / "MyModule"
+    project_dir.mkdir(parents=True)
+    (project_dir / "Project.swift").write_text(
+        'import ProjectDescription\nlet project = Project(name: "MyModule")\n'
+    )
+    source_dir = project_dir / "Sources"
+    source_dir.mkdir()
+    source_code = """
+    protocol ISomePresenter {}
+    protocol ISomeViewController {}
+    protocol IInternetWorker {}
+    class DummyPresenter: ISomePresenter {}
+    class InternetWorker: IInternetWorker {}
+
+    class MyModuleAssembly {
+        func makePresenter() -> MyModulePresenter {
+            let worker = InternetWorker()
+            let presenter = MyModulePresenter(view: makeViewController(), worker: worker)
+            return presenter
+        }
+
+        func makeViewController() -> MyModuleViewController {
+            return MyModuleViewController(presenter: makePresenterStub())
+        }
+
+        func makePresenterStub() -> ISomePresenter {
+            return DummyPresenter()
+        }
+    }
+
+    class MyModulePresenter {
+        weak var viewController: ISomeViewController?
+        var worker: IInternetWorker
+
+        init(view: ISomeViewController?, worker: IInternetWorker) {
+            self.viewController = view
+            self.worker = worker
+        }
+    }
+
+    class MyModuleViewController {
+        var presenter: ISomePresenter
+
+        init(presenter: ISomePresenter) {
+            self.presenter = presenter
+        }
+    }
+    """
+    file_rel_path = Path("Features/MyModule/Sources/Module.swift")
+    parser = SwiftParser(project_root=tmp_path)
+    parsed = parser.parse(source_code, file_rel_path)
+
+    assembly = next(r for r in parsed.entities if r.name == "MyModuleAssembly")
+    assert assembly.module == "MyModule"
+    rel_types = {(rel.edge_type, rel.target_name) for rel in parsed.relationships}
+    assert ("creates", "MyModulePresenter") in rel_types
+    assert ("strongReference", "ISomePresenter") in rel_types
+    assert ("weakReference", "ISomeViewController") in rel_types
 
