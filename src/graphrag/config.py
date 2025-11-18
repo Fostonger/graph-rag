@@ -15,11 +15,12 @@ class ParserOptions(BaseModel):
 class Settings(BaseModel):
     repo_path: Path = Field(default_factory=lambda: Path(".").resolve())
     db_path: Path = Field(default_factory=lambda: Path("graphrag.db").resolve())
+    feature_db_path: Path = Field(default_factory=lambda: Path("graphrag-feature.db").resolve())
     default_branch: str = "master"
     languages: List[str] = Field(default_factory=lambda: ["swift"])
     parser: dict[str, ParserOptions] = Field(default_factory=dict)
 
-    @field_validator("repo_path", "db_path", mode="before")
+    @field_validator("repo_path", "db_path", "feature_db_path", mode="before")
     def _coerce_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser().resolve()
 

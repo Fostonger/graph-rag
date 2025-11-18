@@ -20,6 +20,15 @@ src/graphrag/
 └── models/      # Pydantic schemas shared across layers
 ```
 
+### Feature branch indexer (client-side)
+
+- `FeatureBranchIndexer` keeps a separate SQLite file (default `graphrag-feature.db`) so the master DB can be shipped to remote services while feature work and unstaged files stay local.
+- When `graphrag update` runs on a non-master branch it:
+  1. Updates the master DB as before.
+  2. Resets the feature DB if the branch changed since the last run.
+  3. Replays commits that exist only on the feature branch (starting at the merge-base) and adds a synthetic `worktree:<branch>` commit for unstaged/untracked `.swift` files.
+- Only one feature branch is tracked at a time—switching branches drops the previous DB, keeping the client cache reversible.
+
 ### Future GraphRAG expansion
 
 The SQLite schema intentionally leaves room for:

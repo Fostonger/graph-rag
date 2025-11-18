@@ -1,5 +1,6 @@
 repo_path: .
 db_path: graphrag.db
+feature_db_path: graphrag-feature.db
 default_branch: master
 languages:
   - swift

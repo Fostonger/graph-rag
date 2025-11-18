@@ -46,6 +46,36 @@ class MetadataRepository:
         ).fetchone()
         return row["hash"] if row else None
 
+    def latest_commit_for_branch(self, branch: str) -> Optional[str]:
+        row = self.conn.execute(
+            """
+            SELECT hash FROM commits
+            WHERE branch = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (branch,),
+        ).fetchone()
+        return row["hash"] if row else None
+
+    def latest_real_commit_for_branch(self, branch: str) -> Optional[str]:
+        row = self.conn.execute(
+            """
+            SELECT hash FROM commits
+            WHERE branch = ? AND LENGTH(hash) = 40
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (branch,),
+        ).fetchone()
+        return row["hash"] if row else None
+
+    def delete_commit(self, commit_hash: str) -> None:
+        self.conn.execute(
+            "DELETE FROM commits WHERE hash = ?",
+            (commit_hash,),
+        )
+
     # --- file helpers ---
     def ensure_file(self, path: Path, language: str) -> int:
         path_str = str(path)
@@ -258,6 +288,24 @@ class MetadataRepository:
             "SELECT hash FROM commits ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return row["hash"] if row else None
+
+    # --- schema meta helpers ---
+    def get_schema_value(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT value FROM schema_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_schema_value(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO schema_meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
     # --- aggregations ---
     def persist_entities(
