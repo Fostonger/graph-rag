@@ -119,6 +119,22 @@ def apply_schema(conn: sqlite3.Connection) -> None:
 
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS entity_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            target_entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+            target_name TEXT NOT NULL,
+            target_module TEXT,
+            edge_type TEXT NOT NULL,
+            metadata TEXT,
+            commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
+            is_deleted INTEGER DEFAULT 0
+        );
+        """
+    )
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS extensions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -163,6 +179,19 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_member_versions_member_commit
             ON member_versions(member_id, commit_id);
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationships_source
+            ON entity_relationships(source_entity_id, edge_type);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationships_target
+            ON entity_relationships(target_entity_id, edge_type);
         """
     )
 

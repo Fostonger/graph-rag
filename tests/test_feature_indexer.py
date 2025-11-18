@@ -46,7 +46,7 @@ def test_feature_indexer_indexes_branch_commits_and_worktree(tmp_path):
     new_file.write_text("struct NewType {}\n")
 
     settings = _settings(tmp_path)
-    registry = build_registry(settings.languages)
+    registry = build_registry(settings)
     indexer = FeatureBranchIndexer(settings, registry)
     result = indexer.update()
 
@@ -86,7 +86,7 @@ def test_feature_indexer_resets_when_branch_changes(tmp_path):
     repo.index.commit("feature foo commit")
 
     settings = _settings(tmp_path, "feature-reset.db")
-    registry = build_registry(settings.languages)
+    registry = build_registry(settings)
     indexer = FeatureBranchIndexer(settings, registry)
     result_foo = indexer.update()
     assert result_foo.branch == "feature/foo"
@@ -117,9 +117,51 @@ def test_feature_indexer_resets_when_branch_changes(tmp_path):
 def test_feature_indexer_skips_default_branch(tmp_path):
     repo = _init_repo(tmp_path)
     settings = _settings(tmp_path, "feature-skip.db")
-    registry = build_registry(settings.languages)
+    registry = build_registry(settings)
     indexer = FeatureBranchIndexer(settings, registry)
     result = indexer.update()
     assert result.skipped
     assert result.skipped_reason == "on default branch"
+
+
+def test_feature_indexer_persists_relationships(tmp_path):
+    repo = _init_repo(tmp_path)
+    repo.git.checkout("-b", "feature/graph")
+    graph_file = tmp_path / "Sources" / "Graph.swift"
+    graph_file.write_text(
+        """
+        class Presenter {
+            weak var view: View?
+        }
+
+        class View {
+            var presenter: Presenter
+            init(presenter: Presenter) {
+                self.presenter = presenter
+            }
+        }
+        """
+    )
+    repo.index.add(["Sources/Graph.swift"])
+    repo.index.commit("add graph types")
+
+    settings = _settings(tmp_path, "feature-graph.db")
+    registry = build_registry(settings)
+    indexer = FeatureBranchIndexer(settings, registry)
+    result = indexer.update()
+    assert not result.skipped
+
+    conn = connect(settings.feature_db_path)
+    schema.apply_schema(conn)
+    try:
+        rows = conn.execute(
+            """
+            SELECT edge_type, target_name FROM entity_relationships WHERE is_deleted = 0
+            """
+        ).fetchall()
+        edge_types = {(row["edge_type"], row["target_name"]) for row in rows}
+        assert ("strongReference", "Presenter") in edge_types
+        assert ("weakReference", "View") in edge_types
+    finally:
+        conn.close()
 

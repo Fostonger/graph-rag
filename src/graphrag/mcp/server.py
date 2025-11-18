@@ -13,8 +13,8 @@ from mcp.types import Tool, TextContent
 
 from ..config import Settings, load_settings
 from ..db import schema
-from ..db.connection import get_connection
-from ..db.queries import find_entities, get_members
+from ..db.connection import connect, get_connection
+from ..db.queries import find_entities, get_entity_graph, get_members
 
 server = Server("graphrag-mcp")
 runtime_settings: Optional[Settings] = None
@@ -24,12 +24,15 @@ def _resolve_settings(
     config: Optional[Path],
     repo: Optional[Path],
     db: Optional[Path],
+    feature_db: Optional[Path],
 ) -> Settings:
     settings = load_settings(config)
     if repo:
         settings.repo_path = Path(repo).expanduser().resolve()
     if db:
         settings.db_path = Path(db).expanduser().resolve()
+    if feature_db:
+        settings.feature_db_path = Path(feature_db).expanduser().resolve()
     return settings
 
 
@@ -43,6 +46,23 @@ def _with_connection(func):
     with get_connection(runtime_settings.db_path) as conn:
         schema.apply_schema(conn)
         return func(conn)
+
+
+def _with_graph_connections(func):
+    if runtime_settings is None:
+        raise RuntimeError("MCP server has not been initialized with settings.")
+    feature_conn = None
+    with get_connection(runtime_settings.db_path) as master_conn:
+        schema.apply_schema(master_conn)
+        if runtime_settings.feature_db_path:
+            feature_conn = connect(runtime_settings.feature_db_path)
+            schema.apply_schema(feature_conn)
+        try:
+            return func(master_conn, feature_conn)
+        finally:
+            if feature_conn is not None:
+                feature_conn.commit()
+                feature_conn.close()
 
 
 @server.list_tools()
@@ -100,6 +120,35 @@ async def handle_list_tools() -> list[Tool]:
                 "required": ["entities"],
             },
         ),
+        Tool(
+            name="get_graph",
+            description="Return upstream/downstream dependency graph for a Swift entity.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Entity name serving as the graph root.",
+                    },
+                    "stop_at": {
+                        "type": "string",
+                        "description": "Ancestor/superclass name that caps upstream traversal.",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upstream", "downstream", "both"],
+                        "default": "both",
+                        "description": "Traversal direction relative to the root.",
+                    },
+                    "include_sibling_subgraphs": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, expand sibling nodes beyond a single hop.",
+                    },
+                },
+                "required": ["entity"],
+            },
+        ),
     ]
 
 
@@ -139,6 +188,27 @@ async def handle_call_tool(
         rows = _with_connection(_run)
         return [_json_text({"tool": name, "count": len(rows), "members": rows})]
 
+    if name == "get_graph":
+        entity = arguments.get("entity")
+        if not entity:
+            raise ValueError("entity is required")
+        stop_at = arguments.get("stop_at")
+        direction = arguments.get("direction", "both")
+        include_siblings = bool(arguments.get("include_sibling_subgraphs", False))
+
+        def _run(master_conn, feature_conn):
+            return get_entity_graph(
+                master_conn,
+                feature_conn,
+                entity_name=entity,
+                stop_name=stop_at,
+                direction=direction,
+                include_sibling_subgraphs=include_siblings,
+            )
+
+        payload = _with_graph_connections(_run)
+        return [_json_text({"tool": name, "graph": payload})]
+
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -165,7 +235,8 @@ def run_server() -> None:
     parser.add_argument("--config", type=Path, help="Path to config.yaml")
     parser.add_argument("--repo", type=Path, help="Repository path override")
     parser.add_argument("--db", type=Path, help="Database path override")
+    parser.add_argument("--feature-db", type=Path, help="Feature database override")
     args = parser.parse_args()
-    settings = _resolve_settings(args.config, args.repo, args.db)
+    settings = _resolve_settings(args.config, args.repo, args.db, args.feature_db)
     asyncio.run(_main(settings))
 

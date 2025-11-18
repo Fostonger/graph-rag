@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import sqlite3
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 from git import GitCommandError, Repo
 
@@ -11,7 +11,7 @@ from ..config import Settings
 from ..db import schema
 from ..db.connection import connect, get_connection
 from ..db.repository import MetadataRepository
-from ..models.records import EntityRecord
+from ..models.records import ParsedSource
 from .base import ParserRegistry
 from .git_utils import (
     changed_swift_files,
@@ -96,8 +96,9 @@ class FeatureBranchIndexer:
                 if content is None:
                     store.mark_entities_deleted_for_file(path_obj, commit_id)
                     continue
-                records = self._parse_file(content, path_obj)
-                store.persist_entities(commit_id, records)
+                parsed = self._parse_file(content, path_obj)
+                entity_ids = store.persist_entities(commit_id, parsed.entities)
+                store.persist_relationships(commit_id, entity_ids, parsed.relationships)
             processed.append(commit.hexsha)
         return processed
 
@@ -124,8 +125,9 @@ class FeatureBranchIndexer:
             content = self._read_worktree_content(path_obj)
             if content is None:
                 continue
-            records = self._parse_file(content, path_obj)
-            store.persist_entities(commit_id, records)
+            parsed = self._parse_file(content, path_obj)
+            entity_ids = store.persist_entities(commit_id, parsed.entities)
+            store.persist_relationships(commit_id, entity_ids, parsed.relationships)
 
         return sorted(changes.keys())
 
@@ -181,7 +183,7 @@ class FeatureBranchIndexer:
             return None
         return path_on_disk.read_text(encoding="utf-8")
 
-    def _parse_file(self, content: str, relative_path: Path) -> Iterable[EntityRecord]:
+    def _parse_file(self, content: str, relative_path: Path) -> ParsedSource:
         adapter = self.registry.get("swift")
         return adapter.parse(content, relative_path)
 
