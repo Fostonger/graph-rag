@@ -6,13 +6,68 @@ from collections import defaultdict, deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
+LIKE_ESCAPE_CHAR = "\\"
+
+
+def _split_query_terms(raw: str) -> List[str]:
+    if not raw:
+        return []
+    if "," in raw:
+        pieces = raw.split(",")
+    else:
+        pieces = raw.split()
+    return [piece.strip() for piece in pieces if piece.strip()]
+
+
+def _escape_like_pattern(pattern: str) -> str:
+    escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped.replace("*", "%")
+
+
+def _normalize_patterns(needle: str) -> List[Tuple[str, str]]:
+    """
+    Return a list of (kind, value) pairs where kind is 'exact' or 'like'.
+    """
+    terms = _split_query_terms(needle)
+    if not terms:
+        return [("like", "%")]
+    normalized: List[Tuple[str, str]] = []
+    for term in terms:
+        if "*" in term:
+            normalized.append(("like", _escape_like_pattern(term.lower())))
+        else:
+            normalized.append(("exact", term.lower()))
+    return normalized
+
+
 def find_entities(
     conn: sqlite3.Connection,
     needle: str,
     limit: int = 25,
     include_code: bool = False,
 ) -> List[dict]:
-    like = f"%{needle}%" if needle else "%"
+    patterns = _normalize_patterns(needle)
+    params: Dict[str, Any] = {"limit": limit}
+    where_clauses: List[str] = []
+    for idx, (kind, value) in enumerate(patterns):
+        key = f"p{idx}"
+        if kind == "exact":
+            params[key] = value
+            where_clauses.append(f"LOWER(e.name) = :{key}")
+        else:
+            params[key] = value
+            clause = " OR ".join(
+                [
+                    f"LOWER(e.name) LIKE :{key} ESCAPE '{LIKE_ESCAPE_CHAR}'",
+                    f"LOWER(e.module) LIKE :{key} ESCAPE '{LIKE_ESCAPE_CHAR}'",
+                    f"LOWER(f.path) LIKE :{key} ESCAPE '{LIKE_ESCAPE_CHAR}'",
+                ]
+            )
+            where_clauses.append(f"({clause})")
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " OR ".join(where_clauses)
+
     rows = conn.execute(
         f"""
         WITH latest AS (
@@ -39,11 +94,11 @@ def find_entities(
         JOIN entities e ON e.id = latest.entity_id
         LEFT JOIN files f ON f.id = ev.file_id
         JOIN commits ON commits.id = ev.commit_id
-        WHERE (e.name LIKE :q OR e.module LIKE :q OR f.path LIKE :q)
+        {where_sql}
         ORDER BY e.name
         LIMIT :limit
         """,
-        {"q": like, "limit": limit},
+        params,
     ).fetchall()
     return [dict(row) for row in rows]
 
