@@ -86,6 +86,7 @@ def find_entities(
             ev.end_line,
             ev.signature,
             ev.docstring,
+            ev.properties,
             {"ev.code," if include_code else "NULL AS code,"}
             commits.hash AS commit_hash
         FROM latest
@@ -101,7 +102,20 @@ def find_entities(
         """,
         params,
     ).fetchall()
-    return [dict(row) for row in rows]
+    entities: List[dict] = []
+    for row in rows:
+        payload = dict(row)
+        props_raw = payload.pop("properties", None)
+        if props_raw:
+            try:
+                props = json.loads(props_raw)
+            except json.JSONDecodeError:
+                props = {}
+            payload["target_type"] = props.get("target_type")
+        else:
+            payload["target_type"] = None
+        entities.append(payload)
+    return entities
 
 
 def get_members(
@@ -496,6 +510,12 @@ def _build_graph_payload(
         reference_edges,
     ) = _categorize_relationships(relationships)
 
+    incoming_refs: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for rel in reference_edges:
+        target_id = rel.get("target_stable_id")
+        if target_id:
+            incoming_refs[target_id].append(rel)
+
     focus_nodes = _collect_focus_nodes(start_id, stop_id, creates_by_child)
     display_nodes = set(focus_nodes)
     for rel in reference_edges:
@@ -518,7 +538,7 @@ def _build_graph_payload(
             _append_reference_edges_full(
                 start_id,
                 refs_outgoing,
-                reference_edges,
+                incoming_refs,
                 display_nodes,
                 entities,
                 edges_payload,
@@ -548,13 +568,15 @@ def _build_graph_payload(
         )
         if direction in {"downstream", "both"}:
             _append_reference_edges_limited(
-                reference_edges,
+                refs_outgoing,
+                incoming_refs,
                 focus_nodes,
                 entities,
                 edges_payload,
                 edge_keys,
                 nodes_included,
                 stop_id,
+                max_hops,
             )
 
     if direction in {"upstream", "both"} and not include_siblings:
@@ -661,36 +683,49 @@ def _attach_created_by_edges(
 
 
 def _append_reference_edges_limited(
-    reference_edges: List[Dict[str, Any]],
+    refs_outgoing: Dict[str, List[Dict[str, Any]]],
+    incoming_refs: Dict[str, List[Dict[str, Any]]],
     focus_nodes: set[str],
     entities: Dict[str, dict],
     edges: List[dict],
     edge_keys: set[Tuple[Any, ...]],
     nodes_included: set[str],
     stop_id: Optional[str],
+    max_hops: Optional[int],
 ) -> None:
-    for rel in reference_edges:
-        source_id = rel["source_stable_id"]
-        target_id = rel.get("target_stable_id")
-        if not (
-            (source_id and source_id in focus_nodes)
-            or (target_id and target_id in focus_nodes)
-        ):
+    queue: deque[Tuple[str, int]] = deque([(node_id, 0) for node_id in focus_nodes])
+    visited: set[str] = set()
+    while queue:
+        node_id, depth = queue.popleft()
+        if not node_id or node_id in visited:
             continue
-        _append_reference_edge(
-            rel,
-            entities,
-            edges,
-            edge_keys,
-            nodes_included,
-            stop_id,
-        )
+        visited.add(node_id)
+        if max_hops is not None and depth >= max_hops:
+            continue
+        for rel in refs_outgoing.get(node_id, []):
+            _append_reference_edge(
+                rel,
+                entities,
+                edges,
+                edge_keys,
+                nodes_included,
+                stop_id,
+            )
+        for rel in incoming_refs.get(node_id, []):
+            _append_reference_edge(
+                rel,
+                entities,
+                edges,
+                edge_keys,
+                nodes_included,
+                stop_id,
+            )
 
 
 def _append_reference_edges_full(
     start_id: str,
     refs_outgoing: Dict[str, List[Dict[str, Any]]],
-    reference_edges: List[Dict[str, Any]],
+    incoming_refs: Dict[str, List[Dict[str, Any]]],
     display_nodes: set[str],
     entities: Dict[str, dict],
     edges: List[dict],
@@ -699,12 +734,6 @@ def _append_reference_edges_full(
     stop_id: Optional[str],
     max_hops: Optional[int],
 ) -> None:
-    incoming: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for rel in reference_edges:
-        target_id = rel.get("target_stable_id")
-        if target_id:
-            incoming[target_id].append(rel)
-
     queue: deque[Tuple[str, int]] = deque([(start_id, 0)])
     visited: set[str] = set()
     while queue:
@@ -727,7 +756,7 @@ def _append_reference_edges_full(
             if target_id and target_id not in visited:
                 display_nodes.add(target_id)
                 queue.append((target_id, depth + 1))
-        for rel in incoming.get(node_id, []):
+        for rel in incoming_refs.get(node_id, []):
             _append_reference_edge(
                 rel,
                 entities,
