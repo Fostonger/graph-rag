@@ -73,6 +73,18 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
                 edge_type="weakReference",
                 target_module="MyModule",
             ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name="BasePresenter",
+                edge_type="superclass",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=view.stable_id,
+                target_name="ViewInput",
+                edge_type="conforms",
+                target_module="MyModule",
+            ),
         ],
     )
     master_conn.commit()
@@ -141,6 +153,8 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
     assert ("MyModulePresenter", "MyModuleAssembly", "createdBy") in edge_set
     assert ("MyModuleViewController", "MyModulePresenter", "strongReference") in edge_set
     assert ("MyModulePresenter", "NetworkWorker", "strongReference") not in edge_set
+    assert ("MyModulePresenter", "BasePresenter", "superclass") in edge_set
+    assert ("MyModuleViewController", "ViewInput", "conforms") in edge_set
 
     weak_edge = next(
         edge for edge in graph["edges"] if edge["type"] == "weakReference"
@@ -163,4 +177,97 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
     node_names = {node["name"] for node in graph["nodes"]}
     assert "MyModuleAssembly" not in node_names
     assert "MyModuleViewController" in node_names
+
+
+def test_get_entity_graph_applies_feature_deletions(tmp_path):
+    master_conn = sqlite3.connect(tmp_path / "master_del.db")
+    master_conn.row_factory = sqlite3.Row
+    feature_conn = sqlite3.connect(tmp_path / "feature_del.db")
+    feature_conn.row_factory = sqlite3.Row
+    schema.apply_schema(master_conn)
+    schema.apply_schema(feature_conn)
+
+    assembly = _entity("MyModuleAssembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("MyModulePresenter", "presenter", "Sources/Presenter.swift")
+    view = _entity("MyModuleViewController", "view", "Sources/ViewController.swift")
+    obsolete = _entity("ObsoleteView", "obsolete", "Sources/Obsolete.swift")
+
+    master_repo = MetadataRepository(master_conn)
+    master_commit = master_repo.record_commit("master-del", None, "master", True)
+    master_map = master_repo.persist_entities(
+        master_commit, [assembly, presenter, view, obsolete]
+    )
+    master_repo.persist_relationships(
+        master_commit,
+        master_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=view.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=view.name,
+                edge_type="weakReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=obsolete.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    master_conn.commit()
+
+    feature_repo = MetadataRepository(feature_conn)
+    base_commit = feature_repo.record_commit("feature-base", None, "feature/foo", False)
+    base_map = feature_repo.persist_entities(
+        base_commit, [assembly, presenter, view, obsolete]
+    )
+    feature_repo.persist_relationships(
+        base_commit,
+        base_map,
+        [
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=view.name,
+                edge_type="weakReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=obsolete.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    delete_commit = feature_repo.record_commit(
+        "feature-del", base_commit, "feature/foo", False
+    )
+    feature_repo.mark_entities_deleted_for_file(Path("Sources/Obsolete.swift"), delete_commit)
+    feature_conn.commit()
+
+    graph = get_entity_graph(
+        master_conn,
+        feature_conn,
+        entity_name="MyModulePresenter",
+        stop_name="MyModuleAssembly",
+    )
+
+    node_names = {node["name"] for node in graph["nodes"]}
+    assert "ObsoleteView" not in node_names
+    edge_set = {(edge["source"], edge["target"], edge["type"]) for edge in graph["edges"]}
+    assert ("MyModulePresenter", "ObsoleteView", "strongReference") not in edge_set
+    assert ("MyModulePresenter", "MyModuleViewController", "weakReference") in edge_set
 

@@ -43,8 +43,14 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
     protocol ISomePresenter {}
     protocol ISomeViewController {}
     protocol IInternetWorker {}
+    protocol HasLogger {}
+    class BasePresenter {}
     class DummyPresenter: ISomePresenter {}
     class InternetWorker: IInternetWorker {}
+    class Dependency {}
+    class WorkerBuilder {
+        init(dependency: Dependency) {}
+    }
 
     class MyModuleAssembly {
         func makePresenter() -> MyModulePresenter {
@@ -60,15 +66,29 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
         func makePresenterStub() -> ISomePresenter {
             return DummyPresenter()
         }
+
+        func makeBuilder() -> WorkerBuilder {
+            let builder = WorkerBuilder(dependency: Dependency())
+            return builder
+        }
+
+        func makeImmediate() -> DummyPresenter {
+            DummyPresenter()
+        }
     }
 
-    class MyModulePresenter {
+    class MyModulePresenter: BasePresenter, ISomePresenter {
         weak var viewController: ISomeViewController?
         var worker: IInternetWorker
 
         init(view: ISomeViewController?, worker: IInternetWorker) {
             self.viewController = view
             self.worker = worker
+        }
+
+        func preparedBuilder() -> WorkerBuilder {
+            let prepared = WorkerBuilder(dependency: Dependency())
+            return prepared
         }
     }
 
@@ -79,6 +99,8 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
             self.presenter = presenter
         }
     }
+
+    extension MyModulePresenter: HasLogger {}
     """
     file_rel_path = Path("Features/MyModule/Sources/Module.swift")
     parser = SwiftParser(project_root=tmp_path)
@@ -90,4 +112,10 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
     assert ("creates", "MyModulePresenter") in rel_types
     assert ("strongReference", "ISomePresenter") in rel_types
     assert ("weakReference", "ISomeViewController") in rel_types
+    assert ("creates", "WorkerBuilder") in rel_types
+    assert ("creates", "Dependency") in rel_types
+    assert ("creates", "DummyPresenter") in rel_types
+    assert ("superclass", "BasePresenter") in rel_types
+    assert ("conforms", "ISomePresenter") in rel_types
+    assert ("conforms", "HasLogger") in rel_types
 

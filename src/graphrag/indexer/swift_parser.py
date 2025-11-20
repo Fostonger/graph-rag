@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from tree_sitter import Language, Parser
 from tree_sitter_swift import language as swift_language
@@ -37,8 +37,8 @@ PROPERTY_DECL_RE = re.compile(
     r"(?:var|let)\s+(?P<name>[A-Za-z_]\w*)\s*:\s*(?P<type>[A-Za-z_][\w?.<>, ]*)"
 )
 
-CREATE_EXPR_RE = re.compile(
-    r"(?:=|return)\s+(?P<type>[A-Z][A-Za-z0-9_]*)\s*\(",
+CALL_EXPR_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<type>[A-Z][A-Za-z0-9_]*)\s*\(",
     re.MULTILINE,
 )
 
@@ -50,6 +50,7 @@ class SwiftParser(ParserAdapter):
         self._language = Language(swift_language())
         self._parser = Parser(self._language)
         self._module_resolver = ModuleResolver(project_root)
+        self._known_entities: Dict[str, str] = {}
 
     def parse(self, source: str, path: Path) -> ParsedSource:
         tree = self._parser.parse(source.encode("utf-8"))
@@ -103,9 +104,17 @@ class SwiftParser(ParserAdapter):
                 members=members,
             )
             records.append(record)
+        self._register_entities(records)
         for record in records:
             relationships.extend(self._derive_relationships(record))
         return ParsedSource(entities=records, relationships=relationships)
+
+    def _register_entities(self, entities: List[EntityRecord]) -> None:
+        for record in entities:
+            if record.kind == "extension":
+                continue
+            key = self._simplify_type_name(record.name)
+            self._known_entities[key] = record.kind
 
     def _iter_nodes(self, node):
         stack = [node]
@@ -168,6 +177,7 @@ class SwiftParser(ParserAdapter):
         rels: List[RelationshipRecord] = []
         rels.extend(self._relationships_from_properties(record))
         rels.extend(self._relationships_from_instantiations(record))
+        rels.extend(self._relationships_from_inheritance(record))
         return rels
 
     def _relationships_from_properties(
@@ -224,11 +234,147 @@ class SwiftParser(ParserAdapter):
 
     def _find_created_types(self, code: str) -> Set[str]:
         types: Set[str] = set()
-        for match in CREATE_EXPR_RE.finditer(code):
+        for match in CALL_EXPR_RE.finditer(code):
             type_name = match.group("type")
             if type_name and type_name[0].isupper():
-                types.add(type_name)
+                types.add(self._simplify_type_name(type_name))
         return types
+
+    def _relationships_from_inheritance(
+        self, record: EntityRecord
+    ) -> List[RelationshipRecord]:
+        if record.kind not in {"class", "struct", "enum", "extension"}:
+            return []
+        inherited = self._parse_inherited_types(record.signature)
+        if not inherited:
+            return []
+
+        rels: List[RelationshipRecord] = []
+        remaining = inherited
+        assumed_superclass = False
+        if record.kind == "class":
+            superclass, remaining, assumed_superclass = self._select_superclass(
+                inherited
+            )
+            if superclass:
+                metadata: Dict[str, str] = {}
+                if assumed_superclass:
+                    metadata["assumed"] = "true"
+                rels.append(
+                    RelationshipRecord(
+                        source_stable_id=record.stable_id,
+                        target_name=self._simplify_type_name(superclass),
+                        target_module=record.module,
+                        edge_type="superclass",
+                        metadata=metadata,
+                    )
+                )
+
+        for proto in remaining:
+            metadata = {}
+            if record.kind == "extension":
+                metadata = {"declaredVia": "extension"}
+            rels.append(
+                RelationshipRecord(
+                    source_stable_id=record.stable_id,
+                    target_name=self._simplify_type_name(proto),
+                    target_module=record.module,
+                    edge_type="conforms",
+                    metadata=metadata,
+                )
+            )
+        return rels
+
+    def _parse_inherited_types(self, signature: str) -> List[str]:
+        if ":" not in signature:
+            return []
+        clause = signature.split(":", 1)[1]
+        for stopper in ("{", "where"):
+            idx = clause.find(stopper)
+            if idx != -1:
+                clause = clause[:idx]
+        clause = clause.strip()
+        if not clause:
+            return []
+        parts: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for ch in clause:
+            if ch == "<":
+                depth += 1
+                continue
+            if ch == ">":
+                if depth > 0:
+                    depth -= 1
+                continue
+            if depth > 0:
+                continue
+            if ch == "," and depth == 0:
+                token = "".join(current).strip()
+                if token:
+                    cleaned = self._clean_inherited_token(token)
+                    if cleaned:
+                        parts.append(cleaned)
+                current = []
+                continue
+            current.append(ch)
+        tail = "".join(current).strip()
+        if tail:
+            cleaned_tail = self._clean_inherited_token(tail)
+            if cleaned_tail:
+                parts.append(cleaned_tail)
+        return parts
+
+    def _clean_inherited_token(self, token: str) -> Optional[str]:
+        candidate = token.strip()
+        if not candidate:
+            return None
+        candidate = candidate.replace("?", "").replace("!", "")
+        candidate = candidate.replace("any ", "")
+        while candidate.endswith("{"):
+            candidate = candidate[:-1].rstrip()
+        return candidate or None
+
+    def _select_superclass(
+        self, inherited: List[str]
+    ) -> Tuple[Optional[str], List[str], bool]:
+        remaining = list(inherited)
+        for idx, type_name in enumerate(inherited):
+            classification = self._classify_inherited_type(type_name)
+            if classification == "class":
+                remaining.pop(idx)
+                return type_name, remaining, False
+        if inherited:
+            first_classification = self._classify_inherited_type(inherited[0])
+            if first_classification is None:
+                return inherited[0], inherited[1:], True
+        return None, inherited, False
+
+    def _classify_inherited_type(self, type_name: str) -> Optional[str]:
+        simplified = self._simplify_type_name(type_name)
+        kind = self._known_entities.get(simplified)
+        if kind:
+            return kind
+        if self._looks_like_protocol(simplified):
+            return "protocol"
+        if simplified in {"AnyObject", "Sendable"}:
+            return "protocol"
+        return None
+
+    def _looks_like_protocol(self, name: str) -> bool:
+        if name.startswith("I") and len(name) > 1 and name[1].isupper():
+            return True
+        if name.endswith("Protocol") or name.endswith("Delegate") or name.endswith(
+            "DataSource"
+        ):
+            return True
+        return False
+
+    def _simplify_type_name(self, name: str) -> str:
+        simple = name.split("<", 1)[0]
+        if "." in simple:
+            simple = simple.split(".")[-1]
+        return simple.strip()
 
     def _normalize_type(self, raw: str) -> str:
         candidate = raw.strip()
