@@ -12,7 +12,9 @@ from graphrag.mcp import server as mcp_server
 from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
 
 
-def build_entity(file_path: Path) -> EntityRecord:
+def build_entity(
+    file_path: Path, name: str = "Greeter", stable_id: str = "stable-greeter"
+) -> EntityRecord:
     member = MemberRecord(
         name="greet",
         kind="function",
@@ -22,16 +24,16 @@ def build_entity(file_path: Path) -> EntityRecord:
         end_line=7,
     )
     return EntityRecord(
-        name="Greeter",
+        name=name,
         kind="struct",
         module="Sources",
         language="swift",
         file_path=file_path,
         start_line=1,
         end_line=10,
-        signature="struct Greeter",
-        code="struct Greeter {}",
-        stable_id="stable-greeter",
+        signature=f"struct {name}",
+        code=f"struct {name} {{}}",
+        stable_id=stable_id,
         members=[member],
     )
 
@@ -128,18 +130,37 @@ def seed_graph_db(db_path: Path) -> None:
 def test_mcp_tools_resolve_entities_and_members(tmp_path):
     db_path = tmp_path / "mcp.db"
     seed_db(db_path)
+    conn = connect(db_path)
+    schema.apply_schema(conn)
+    try:
+        repo = MetadataRepository(conn)
+        commit_id = repo.record_commit("pattern", None, "master", True)
+        repo.persist_entities(
+            commit_id,
+            [
+                build_entity(
+                    Path("Tests/UserBuilderTests.swift"),
+                    name="UserBuilderTests",
+                    stable_id="stable-builder-tests",
+                )
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
     settings = Settings(repo_path=tmp_path, db_path=db_path)
     original = mcp_server.runtime_settings
     mcp_server.runtime_settings = settings
     try:
         entities = asyncio.run(
             mcp_server.handle_call_tool(
-            "find_entities", {"query": "Greeter", "include_code": False}
-        )
+                "find_entities", {"query": "*buildertests, Greeter", "include_code": False}
+            )
         )
         payload = json.loads(entities[0].text)
-        assert payload["count"] == 1
-        assert payload["entities"][0]["name"] == "Greeter"
+        assert payload["count"] == 2
+        returned = {row["name"] for row in payload["entities"]}
+        assert returned == {"Greeter", "UserBuilderTests"}
 
         members = asyncio.run(
             mcp_server.handle_call_tool(

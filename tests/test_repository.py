@@ -3,6 +3,7 @@ from pathlib import Path
 
 from graphrag.db import schema
 from graphrag.db.repository import MetadataRepository
+from graphrag.db.queries import find_entities
 from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
 
 
@@ -131,4 +132,50 @@ def test_repository_persist_relationships(tmp_path):
     ).fetchall()
     assert len(active) == 1
     assert active[0]["edge_type"] == "weakReference"
+
+
+def test_find_entities_supports_wildcards(tmp_path):
+    db_path = tmp_path / "graphrag.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    repo = MetadataRepository(conn)
+
+    commit_id = repo.record_commit("abc123", None, "master", True)
+    repo.persist_entities(
+        commit_id,
+        [
+            make_entity(
+                name="UserBuilderTests",
+                stable_id="stable-builder",
+                path="Tests/UserBuilderTests.swift",
+                module="Tests/User",
+            ),
+            make_entity(
+                name="SomeClassHelper",
+                stable_id="stable-helper",
+                path="Sources/SomeClassHelper.swift",
+                module="Sources",
+            ),
+            make_entity(
+                name="MyClass",
+                stable_id="stable-exact",
+                path="Sources/MyClass.swift",
+                module="Sources",
+            ),
+            make_entity(
+                name="MyClassCopy",
+                stable_id="stable-copy",
+                path="Sources/MyClassCopy.swift",
+                module="Sources",
+            ),
+        ],
+    )
+
+    rows = find_entities(conn, "*BuilderTests, SomeClass*, MyClass", limit=10)
+    names = {row["name"] for row in rows}
+    assert names == {"UserBuilderTests", "SomeClassHelper", "MyClass"}
+
+    lower_case_rows = find_entities(conn, "*buildertests", limit=10)
+    assert {row["name"] for row in lower_case_rows} == {"UserBuilderTests"}
 
