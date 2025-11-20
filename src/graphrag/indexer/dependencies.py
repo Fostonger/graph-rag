@@ -37,19 +37,34 @@ class TuistDependenciesWorker(DependenciesWorker):
         self._targets: List[TargetInfo] = self._load_targets()
 
     def target_for_file(self, relative_path: Path) -> Optional[TargetInfo]:
-        rel_posix = relative_path.as_posix()
         best: Optional[TargetInfo] = None
         best_depth = -1
+        abs_path: Optional[Path] = None
+        if self.project_root:
+            abs_path = (self.project_root / relative_path).resolve()
         for target in self._targets:
             for root in target.source_roots:
-                root_posix = root.as_posix()
-                if not rel_posix.startswith(root_posix):
+                if self._path_is_within(relative_path, root):
+                    depth = len(root.parts)
+                elif abs_path is not None and root.is_absolute():
+                    if not self._path_is_within(abs_path, root):
+                        continue
+                    depth = len(root.parts)
+                else:
                     continue
-                depth = len(root_posix)
                 if depth > best_depth:
                     best = target
                     best_depth = depth
         return best
+
+    def _path_is_within(self, candidate: Path, root: Path) -> bool:
+        candidate_parts = candidate.parts
+        root_parts = root.parts
+        if not root_parts:
+            return True
+        if len(candidate_parts) < len(root_parts):
+            return False
+        return candidate_parts[: len(root_parts)] == root_parts
 
     def _load_targets(self) -> List[TargetInfo]:
         targets: List[TargetInfo] = []

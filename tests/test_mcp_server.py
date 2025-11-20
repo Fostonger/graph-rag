@@ -149,6 +149,7 @@ def test_mcp_tools_resolve_entities_and_members(tmp_path):
                     Path("Tests/UserBuilderTests.swift"),
                     name="UserBuilderTests",
                     stable_id="stable-builder-tests",
+                    target_type="test",
                 )
             ],
         )
@@ -168,6 +169,10 @@ def test_mcp_tools_resolve_entities_and_members(tmp_path):
         assert payload["count"] == 2
         returned = {row["name"] for row in payload["entities"]}
         assert returned == {"Greeter", "UserBuilderTests"}
+        greeter_entry = next(row for row in payload["entities"] if row["name"] == "Greeter")
+        assert greeter_entry["target_type"] == "app"
+        builder_entry = next(row for row in payload["entities"] if row["name"] == "UserBuilderTests")
+        assert builder_entry["target_type"] == "test"
 
         members = asyncio.run(
             mcp_server.handle_call_tool(

@@ -320,6 +320,41 @@ def test_get_entity_graph_limits_hops(tmp_path):
     assert ("EntityA", "EntityB", "strongReference") in limited_edges
 
 
+def test_get_entity_graph_zero_hops_removes_references(tmp_path):
+    conn = sqlite3.connect(tmp_path / "zero-hops.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    source = _entity("Source", "source", "Sources/Source.swift")
+    target = _entity("Target", "target", "Sources/Target.swift")
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("zero", None, "master", True)
+    entity_map = repo.persist_entities(commit, [source, target])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=source.stable_id,
+                target_name=target.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            )
+        ],
+    )
+    conn.commit()
+
+    limited_graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Source",
+        include_sibling_subgraphs=False,
+        max_hops=0,
+    )
+    assert limited_graph["edges"] == []
+    node_names = {node["name"] for node in limited_graph["nodes"]}
+    assert node_names == {"Source"}
+
+
 def test_get_entity_graph_respects_target_type_filter(tmp_path):
     conn = sqlite3.connect(tmp_path / "target-filter.db")
     conn.row_factory = sqlite3.Row

@@ -142,3 +142,48 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
     assert ("conforms", "ISomePresenter") in rel_types
     assert ("conforms", "HasLogger") in rel_types
 
+
+def test_dependencies_worker_handles_shared_prefixes(tmp_path):
+    project_file = tmp_path / "Project.swift"
+    project_file.write_text(
+        """
+        import ProjectDescription
+
+        let project = Project(
+            name: "Workspace",
+            targets: [
+                Target(
+                    name: "App",
+                    platform: .iOS,
+                    product: .app,
+                    sources: ["Modules/App/Sources/**"]
+                ),
+                Target(
+                    name: "AppTests",
+                    platform: .iOS,
+                    product: .unitTests,
+                    sources: ["Modules/AppTests/Tests/**"]
+                )
+            ]
+        )
+        """
+    )
+    app_dir = tmp_path / "Modules" / "App" / "Sources"
+    app_dir.mkdir(parents=True)
+    tests_dir = tmp_path / "Modules" / "AppTests" / "Tests"
+    tests_dir.mkdir(parents=True)
+    test_file = tests_dir / "ExampleTests.swift"
+    test_file.write_text(
+        """
+        import XCTest
+        class ExampleTests: XCTestCase {}
+        """
+    )
+    relative_path = test_file.relative_to(tmp_path)
+    deps_worker = TuistDependenciesWorker(tmp_path)
+    parser = SwiftParser(project_root=tmp_path, dependencies=deps_worker)
+    parsed = parser.parse(test_file.read_text(), relative_path)
+    entity = next(r for r in parsed.entities if r.name == "ExampleTests")
+    assert entity.target_type == "test"
+    assert entity.module == "AppTests"
+

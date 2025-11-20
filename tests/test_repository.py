@@ -2,6 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from graphrag.db import schema
+from graphrag.db.queries import find_entities
 from graphrag.db.repository import MetadataRepository
 from graphrag.db.queries import find_entities
 from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
@@ -132,6 +133,23 @@ def test_repository_persist_relationships(tmp_path):
     ).fetchall()
     assert len(active) == 1
     assert active[0]["edge_type"] == "weakReference"
+
+
+def test_find_entities_includes_target_type(tmp_path):
+    db_path = tmp_path / "find.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    repo = MetadataRepository(conn)
+    commit_id = repo.record_commit("find", None, "master", True)
+    entity = make_entity(name="Helper", stable_id="helper", module="Helpers")
+    entity.target_type = "test"
+    repo.persist_entities(commit_id, [entity])
+    conn.commit()
+
+    rows = find_entities(conn, "Helper")
+    assert rows
+    assert rows[0]["target_type"] == "test"
 
 
 def test_find_entities_supports_wildcards(tmp_path):
