@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..models.records import EntityRecord, MemberRecord, RelationshipRecord
 
@@ -334,19 +334,33 @@ class MetadataRepository:
         rel_list = list(relationships)
         if not entity_id_map and not rel_list:
             return
-        source_ids = list({entity_id for entity_id in entity_id_map.values()})
-        self._tombstone_relationships(source_ids, commit_id)
+        source_ids: Set[int] = set(entity_id_map.values())
+        source_cache: Dict[str, Optional[int]] = {
+            stable_id: entity_id for stable_id, entity_id in entity_id_map.items()
+        }
         target_cache: Dict[Tuple[str, Optional[str]], Optional[int]] = {}
+        resolved: List[Tuple[int, RelationshipRecord, Optional[int]]] = []
         for rel in rel_list:
-            source_id = entity_id_map.get(rel.source_stable_id)
+            source_id = source_cache.get(rel.source_stable_id)
+            if source_id is None:
+                source_id = self._lookup_entity_id_by_stable_id(rel.source_stable_id)
+                source_cache[rel.source_stable_id] = source_id
             if source_id is None:
                 continue
+            source_ids.add(source_id)
             target_key = (rel.target_name, rel.target_module)
             if target_key not in target_cache:
                 target_cache[target_key] = self._lookup_entity_id(
                     rel.target_name, rel.target_module
                 )
             target_id = target_cache[target_key]
+            resolved.append((source_id, rel, target_id))
+
+        if not source_ids:
+            return
+
+        self._tombstone_relationships(list(source_ids), commit_id)
+        for source_id, rel, target_id in resolved:
             self._insert_relationship(
                 source_entity_id=source_id,
                 target_entity_id=target_id,
@@ -383,6 +397,13 @@ class MetadataRepository:
                 """,
                 (name,),
             ).fetchone()
+        return int(row["id"]) if row else None
+
+    def _lookup_entity_id_by_stable_id(self, stable_id: str) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT id FROM entities WHERE stable_id = ?",
+            (stable_id,),
+        ).fetchone()
         return int(row["id"]) if row else None
 
     def _tombstone_relationships(

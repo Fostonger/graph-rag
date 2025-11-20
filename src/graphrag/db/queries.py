@@ -3,10 +3,11 @@ from __future__ import annotations
 import sqlite3
 import json
 from collections import defaultdict, deque
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 LIKE_ESCAPE_CHAR = "\\"
+STRUCTURAL_EDGE_TYPES = {"superclass", "conforms"}
 
 
 def _split_query_terms(raw: str) -> List[str]:
@@ -174,13 +175,26 @@ def get_entity_graph(
     direction = (direction or "both").lower()
     if direction not in {"upstream", "downstream", "both"}:
         raise ValueError("direction must be one of upstream, downstream, both")
+    master_entities, master_deleted = _load_entities(master_conn, "master")
+    feature_entities, feature_deleted = (
+        _load_entities(feature_conn, "feature") if feature_conn else ({}, set())
+    )
     entities = _merge_entities(
-        _load_entities(master_conn, "master"),
-        _load_entities(feature_conn, "feature") if feature_conn else {},
+        master_entities, feature_entities, master_deleted, feature_deleted
+    )
+    master_rels, master_rel_deleted = _load_relationships(master_conn, "master")
+    feature_rels, feature_rel_deleted = (
+        _load_relationships(feature_conn, "feature") if feature_conn else ([], set())
     )
     relationships = _merge_relationships(
-        _load_relationships(master_conn, "master"),
-        _load_relationships(feature_conn, "feature") if feature_conn else [],
+        master_rels,
+        feature_rels,
+        master_rel_deleted,
+        feature_rel_deleted,
+    )
+    deleted_stable_ids = master_deleted.union(feature_deleted)
+    relationships = _prune_relationships_for_deleted_entities(
+        relationships, deleted_stable_ids
     )
     start_node = _pick_entity_by_name(entities, entity_name)
     if not start_node:
@@ -197,15 +211,14 @@ def get_entity_graph(
     return graph_payload
 
 
-def _load_entities(conn: sqlite3.Connection, origin: str) -> Dict[str, dict]:
+def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dict], Set[str]]:
     if conn is None:
-        return {}
+        return {}, set()
     rows = conn.execute(
         """
         WITH latest AS (
             SELECT entity_id, MAX(commit_id) AS commit_id
             FROM entity_versions
-            WHERE is_deleted = 0
             GROUP BY entity_id
         )
         SELECT
@@ -217,6 +230,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Dict[str, dict]:
             f.path AS file_path,
             ev.signature,
             commits.hash AS commit_hash,
+            ev.is_deleted,
             (
                 SELECT GROUP_CONCAT(m.name, '|')
                 FROM members m
@@ -232,7 +246,11 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Dict[str, dict]:
         """
     ).fetchall()
     entities: Dict[str, dict] = {}
+    tombstones: Set[str] = set()
     for row in rows:
+        if row["is_deleted"]:
+            tombstones.add(row["stable_id"])
+            continue
         member_names = (
             row["member_names"].split("|") if row["member_names"] else []
         )
@@ -248,14 +266,14 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Dict[str, dict]:
             "member_names": member_names,
             "origin": origin,
         }
-    return entities
+    return entities, tombstones
 
 
 def _load_relationships(
     conn: sqlite3.Connection, origin: str
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Set[Tuple[Any, ...]]]:
     if conn is None:
-        return []
+        return [], set()
     rows = conn.execute(
         """
         WITH ranked AS (
@@ -279,6 +297,7 @@ def _load_relationships(
             ranked.target_module,
             ranked.edge_type,
             ranked.metadata,
+            ranked.is_deleted,
             src.stable_id AS source_stable_id,
             src.name AS source_name,
             tgt.stable_id AS target_stable_id,
@@ -287,34 +306,50 @@ def _load_relationships(
         JOIN entities src ON src.id = ranked.source_entity_id
         LEFT JOIN entities tgt ON tgt.id = ranked.target_entity_id
         WHERE ranked.rn = 1
-          AND ranked.is_deleted = 0
         """
     ).fetchall()
     relationships: List[Dict[str, Any]] = []
+    tombstones: Set[Tuple[Any, ...]] = set()
     for row in rows:
         metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-        relationships.append(
-            {
-                "source_entity_id": row["source_entity_id"],
-                "target_entity_id": row["target_entity_id"],
-                "target_name": row["target_name"],
-                "target_module": row["target_module"],
-                "edge_type": row["edge_type"],
-                "metadata": metadata,
-                "source_stable_id": row["source_stable_id"],
-                "source_name": row["source_name"],
-                "target_stable_id": row["target_stable_id"],
-                "target_entity_name": row["target_entity_name"],
-                "origin": origin,
-            }
-        )
-    return relationships
+        rel = {
+            "source_entity_id": row["source_entity_id"],
+            "target_entity_id": row["target_entity_id"],
+            "target_name": row["target_name"],
+            "target_module": row["target_module"],
+            "edge_type": row["edge_type"],
+            "metadata": metadata,
+            "source_stable_id": row["source_stable_id"],
+            "source_name": row["source_name"],
+            "target_stable_id": row["target_stable_id"],
+            "target_entity_name": row["target_entity_name"],
+            "origin": origin,
+        }
+        key = _relationship_key(rel)
+        if row["is_deleted"]:
+            tombstones.add(key)
+            continue
+        relationships.append(rel)
+    return relationships, tombstones
 
 
-def _merge_entities(master: Dict[str, dict], feature: Dict[str, dict]) -> Dict[str, dict]:
-    merged: Dict[str, dict] = {}
-    merged.update(master)
-    merged.update(feature)
+def _merge_entities(
+    master: Dict[str, dict],
+    feature: Dict[str, dict],
+    master_deleted: Set[str],
+    feature_deleted: Set[str],
+) -> Dict[str, dict]:
+    merged: Dict[str, dict] = {
+        stable_id: entity
+        for stable_id, entity in master.items()
+        if stable_id not in master_deleted
+    }
+    for stable_id, entity in feature.items():
+        if stable_id in feature_deleted:
+            continue
+        merged[stable_id] = entity
+    for stable_id in feature_deleted:
+        merged.pop(stable_id, None)
     return merged
 
 
@@ -331,13 +366,39 @@ def _relationship_key(rel: Dict[str, Any]) -> Tuple[Any, ...]:
 def _merge_relationships(
     master: List[Dict[str, Any]],
     feature: List[Dict[str, Any]],
+    master_deleted: Set[Tuple[Any, ...]],
+    feature_deleted: Set[Tuple[Any, ...]],
 ) -> List[Dict[str, Any]]:
     merged: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for rel in master:
-        merged[_relationship_key(rel)] = rel
+        key = _relationship_key(rel)
+        if key in master_deleted:
+            continue
+        merged[key] = rel
     for rel in feature:
-        merged[_relationship_key(rel)] = rel
+        key = _relationship_key(rel)
+        if key in feature_deleted:
+            continue
+        merged[key] = rel
+    for key in feature_deleted:
+        merged.pop(key, None)
     return list(merged.values())
+
+
+def _prune_relationships_for_deleted_entities(
+    relationships: List[Dict[str, Any]], deleted_nodes: Set[str]
+) -> List[Dict[str, Any]]:
+    if not deleted_nodes:
+        return relationships
+    pruned: List[Dict[str, Any]] = []
+    for rel in relationships:
+        if rel["source_stable_id"] in deleted_nodes:
+            continue
+        target_id = rel.get("target_stable_id")
+        if target_id and target_id in deleted_nodes:
+            continue
+        pruned.append(rel)
+    return pruned
 
 
 def _pick_entity_by_name(entities: Dict[str, dict], name: Optional[str]) -> Optional[dict]:
@@ -445,13 +506,22 @@ def _build_graph_payload(
     if start_id not in nodes_included and (not stop_id or start_id != stop_id):
         nodes_included.add(start_id)
 
+    _attach_structural_edges(
+        reference_edges,
+        nodes_included,
+        entities,
+        edges_payload,
+        edge_keys,
+        stop_id,
+    )
+
+    visible_nodes = [sid for sid in nodes_included if sid in entities]
     node_payloads = [
         _serialize_node(entities[sid])
         for sid in sorted(
-            nodes_included,
+            visible_nodes,
             key=lambda stable_id: entities[stable_id]["name"],
         )
-        if sid in entities
     ]
     return {
         "entity": _summarize_node(start_node),
@@ -687,6 +757,30 @@ def _add_node(nodes: set[str], stable_id: Optional[str], stop_id: Optional[str])
     if stop_id and stable_id == stop_id:
         return
     nodes.add(stable_id)
+
+
+def _attach_structural_edges(
+    reference_edges: List[Dict[str, Any]],
+    included_nodes: set[str],
+    entities: Dict[str, dict],
+    edges: List[dict],
+    edge_keys: set,
+    stop_id: Optional[str],
+) -> None:
+    for rel in reference_edges:
+        if rel["edge_type"] not in STRUCTURAL_EDGE_TYPES:
+            continue
+        source_id = rel["source_stable_id"]
+        if not source_id or source_id not in included_nodes:
+            continue
+        _append_reference_edge(
+            rel,
+            entities,
+            edges,
+            edge_keys,
+            included_nodes,
+            stop_id,
+        )
 
 
 def _entity_label(
