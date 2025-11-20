@@ -10,8 +10,24 @@ Anthropic MCP server for Cursor-like LLM agents.
   incremental updates tied to Git commit hashes.
 - **SQLite store**: Normalized schema maintains entities, members, extensions,
   and per-commit snapshots.
-- **MCP server**: `graphrag-mcp` exposes `find_entities` and `get_members`
-  tools backed by the indexed data.
+- **MCP server**: `graphrag-mcp` exposes `find_entities`, `get_members`, and
+  `get_graph` tools backed by the indexed data.
+
+## Graph tooling
+
+- `find_entities` accepts case-insensitive glob-style filters (e.g.
+  `*BuilderTests` or `Widget*`), making it easier to target large batches of
+  symbols.
+- `get_graph` accepts two optional parameters:
+  - `max_hops` limits downstream traversal and defaults to the `graph.max_hops`
+    value from `config.yaml`.
+  - `targetType` filters nodes by build target (`app`, `test`, or `all`) so
+    graphs can exclude unit-test-only code.
+- Graph traversal defaults are controlled via the `graph` section of
+  `config.yaml`, which also selects the build system integration (`tuist` or
+  `geko`) used to discover module/target metadata. The dependencies worker scans
+  all `Project.swift` manifests so indexed entities are annotated with their
+  target type for downstream filtering.
 
 ## Quick start
 
