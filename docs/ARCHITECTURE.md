@@ -29,6 +29,26 @@ src/graphrag/
   3. Replays commits that exist only on the feature branch (starting at the merge-base) and adds a synthetic `worktree:<branch>` commit for unstaged/untracked `.swift` files.
 - Only one feature branch is tracked at a time—switching branches drops the previous DB, keeping the client cache reversible.
 
+### Build-system aware module metadata
+
+- A `DependenciesWorker` scans every `Project.swift` manifest (currently Tuist/Geko
+  compatible) to discover targets, their product types, and source roots.
+- Each parsed entity is annotated with both the resolved module name and a
+  `target_type` (`app` vs `test`) derived from the target's product.
+- This metadata is persisted in `entity_versions.properties` so downstream
+  queries can filter out unit-test-only code paths.
+
+### Graph traversal defaults
+
+- The `graph` block in `config.yaml` controls which build system integration to
+  use and sets the default `max_hops` used by the MCP server when expanding
+  reference edges.
+- `get_graph` enforces the hop limit for sibling-subgraph traversals, greatly
+  reducing large call graphs on huge repositories.
+- Clients can supply `targetType` (`app`, `test`, or `all`) to remove unwanted
+  code paths, and the response includes the filter + hop settings that were
+  applied.
+
 ### Future GraphRAG expansion
 
 The SQLite schema intentionally leaves room for:
