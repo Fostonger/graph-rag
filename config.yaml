@@ -8,4 +8,7 @@ parser:
   swift:
     enable_extensions: true
     include_doc_comments: true
+graph:
+  build_system: tuist
+  max_hops: 2
 

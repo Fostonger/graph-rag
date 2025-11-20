@@ -13,7 +13,10 @@ from graphrag.models.records import EntityRecord, MemberRecord, RelationshipReco
 
 
 def build_entity(
-    file_path: Path, name: str = "Greeter", stable_id: str = "stable-greeter"
+    file_path: Path,
+    name: str = "Greeter",
+    stable_id: str = "stable-greeter",
+    target_type: str = "app",
 ) -> EntityRecord:
     member = MemberRecord(
         name="greet",
@@ -34,6 +37,7 @@ def build_entity(
         signature=f"struct {name}",
         code=f"struct {name} {{}}",
         stable_id=stable_id,
+        target_type=target_type,
         members=[member],
     )
 
@@ -64,6 +68,7 @@ def seed_graph_db(db_path: Path) -> None:
         signature="class MyModuleAssembly",
         code="class MyModuleAssembly {}",
         stable_id="assembly",
+        target_type="app",
         members=[],
     )
     presenter = EntityRecord(
@@ -77,6 +82,7 @@ def seed_graph_db(db_path: Path) -> None:
         signature="class MyModulePresenter",
         code="class MyModulePresenter {}",
         stable_id="presenter",
+        target_type="app",
         members=[],
     )
     view = EntityRecord(
@@ -90,6 +96,7 @@ def seed_graph_db(db_path: Path) -> None:
         signature="class MyModuleViewController",
         code="class MyModuleViewController {}",
         stable_id="view",
+        target_type="app",
         members=[],
     )
     id_map = repo.persist_entities(commit_id, [assembly, presenter, view])

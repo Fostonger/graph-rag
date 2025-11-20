@@ -145,6 +145,17 @@ async def handle_list_tools() -> list[Tool]:
                         "default": False,
                         "description": "If true, expand sibling nodes beyond a single hop.",
                     },
+                    "max_hops": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Reference traversal depth limit.",
+                    },
+                    "targetType": {
+                        "type": "string",
+                        "enum": ["app", "test", "all"],
+                        "default": "app",
+                        "description": "Filter nodes by target type.",
+                    },
                 },
                 "required": ["entity"],
             },
@@ -195,6 +206,12 @@ async def handle_call_tool(
         stop_at = arguments.get("stop_at")
         direction = arguments.get("direction", "both")
         include_siblings = bool(arguments.get("include_sibling_subgraphs", False))
+        max_hops_arg = arguments.get("max_hops")
+        if max_hops_arg is None:
+            max_hops = runtime_settings.graph.max_hops if runtime_settings else None
+        else:
+            max_hops = int(max_hops_arg)
+        target_type = (arguments.get("targetType") or "app").lower()
 
         def _run(master_conn, feature_conn):
             return get_entity_graph(
@@ -204,6 +221,8 @@ async def handle_call_tool(
                 stop_name=stop_at,
                 direction=direction,
                 include_sibling_subgraphs=include_siblings,
+                max_hops=max_hops,
+                target_type=target_type,
             )
 
         payload = _with_graph_connections(_run)

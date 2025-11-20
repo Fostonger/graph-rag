@@ -152,12 +152,13 @@ class MetadataRepository:
         record: EntityRecord,
         is_deleted: bool = False,
     ) -> None:
-        props = json.dumps(
-            {
-                "extended_type": record.extended_type,
-                "member_count": len(record.members),
-            }
-        )
+        props_dict = {
+            "extended_type": record.extended_type,
+            "member_count": len(record.members),
+        }
+        if record.target_type:
+            props_dict["target_type"] = record.target_type
+        props = json.dumps(props_dict)
         self.conn.execute(
             """
             INSERT INTO entity_versions (

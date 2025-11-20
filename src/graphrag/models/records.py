@@ -29,8 +29,8 @@ class EntityRecord:
     stable_id: str
     docstring: Optional[str] = None
     extended_type: Optional[str] = None
+    target_type: Optional[str] = None
     members: List[MemberRecord] = field(default_factory=list)
-
 
 @dataclass(slots=True)
 class RelationshipRecord:
@@ -45,4 +45,5 @@ class RelationshipRecord:
 class ParsedSource:
     entities: List[EntityRecord] = field(default_factory=list)
     relationships: List[RelationshipRecord] = field(default_factory=list)
+
 

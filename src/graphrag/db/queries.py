@@ -171,6 +171,8 @@ def get_entity_graph(
     stop_name: Optional[str] = None,
     direction: str = "both",
     include_sibling_subgraphs: bool = False,
+    max_hops: Optional[int] = None,
+    target_type: str = "app",
 ) -> dict:
     direction = (direction or "both").lower()
     if direction not in {"upstream", "downstream", "both"}:
@@ -200,6 +202,18 @@ def get_entity_graph(
     if not start_node:
         raise ValueError(f"Entity '{entity_name}' was not found in indexed metadata")
     stop_node = _pick_entity_by_name(entities, stop_name) if stop_name else None
+    target_type = (target_type or "app").lower()
+    if target_type not in {"app", "test", "all"}:
+        raise ValueError("targetType must be one of app, test, all")
+    if not _matches_target_filter(start_node, target_type):
+        raise ValueError(
+            f"Entity '{entity_name}' does not belong to targetType '{target_type}'"
+        )
+    entities, relationships = _filter_by_target_type(
+        entities, relationships, target_type
+    )
+    start_node = entities[start_node["stable_id"]]
+    stop_node = _pick_entity_by_name(entities, stop_name) if stop_name else None
     graph_payload = _build_graph_payload(
         entities=entities,
         relationships=relationships,
@@ -207,7 +221,10 @@ def get_entity_graph(
         stop_node=stop_node,
         direction=direction,
         include_siblings=include_sibling_subgraphs,
+        max_hops=max_hops,
     )
+    graph_payload["target_type_filter"] = target_type
+    graph_payload["max_hops"] = max_hops
     return graph_payload
 
 
@@ -231,6 +248,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             ev.signature,
             commits.hash AS commit_hash,
             ev.is_deleted,
+            ev.properties,
             (
                 SELECT GROUP_CONCAT(m.name, '|')
                 FROM members m
@@ -251,6 +269,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
         if row["is_deleted"]:
             tombstones.add(row["stable_id"])
             continue
+        props = json.loads(row["properties"]) if row["properties"] else {}
         member_names = (
             row["member_names"].split("|") if row["member_names"] else []
         )
@@ -265,6 +284,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             "commit_hash": row["commit_hash"],
             "member_names": member_names,
             "origin": origin,
+            "target_type": props.get("target_type"),
         }
     return entities, tombstones
 
@@ -401,6 +421,44 @@ def _prune_relationships_for_deleted_entities(
     return pruned
 
 
+def _filter_by_target_type(
+    entities: Dict[str, dict],
+    relationships: List[Dict[str, Any]],
+    filter_type: str,
+) -> Tuple[Dict[str, dict], List[Dict[str, Any]]]:
+    if filter_type == "all":
+        return entities, relationships
+    filtered_entities: Dict[str, dict] = {}
+    removed: Set[str] = set()
+    for stable_id, entity in entities.items():
+        if _matches_target_filter(entity, filter_type):
+            filtered_entities[stable_id] = entity
+        else:
+            removed.add(stable_id)
+    if not removed:
+        return filtered_entities, relationships
+    filtered_relationships: List[Dict[str, Any]] = []
+    for rel in relationships:
+        if rel["source_stable_id"] in removed:
+            continue
+        target_id = rel.get("target_stable_id")
+        if target_id and target_id in removed:
+            continue
+        filtered_relationships.append(rel)
+    return filtered_entities, filtered_relationships
+
+
+def _matches_target_filter(entity: Optional[dict], filter_type: str) -> bool:
+    if filter_type == "all":
+        return True
+    if entity is None:
+        return True
+    entity_type = entity.get("target_type") or "app"
+    if filter_type == "test":
+        return entity_type == "test"
+    return entity_type != "test"
+
+
 def _pick_entity_by_name(entities: Dict[str, dict], name: Optional[str]) -> Optional[dict]:
     if not name:
         return None
@@ -424,6 +482,7 @@ def _build_graph_payload(
     stop_node: Optional[dict],
     direction: str,
     include_siblings: bool,
+    max_hops: Optional[int],
 ) -> dict:
     start_id = start_node["stable_id"]
     stop_id = stop_node["stable_id"] if stop_node else None
@@ -466,6 +525,7 @@ def _build_graph_payload(
                 edge_keys,
                 nodes_included,
                 stop_id,
+                max_hops,
             )
         _attach_created_by_edges(
             display_nodes,
@@ -637,6 +697,7 @@ def _append_reference_edges_full(
     edge_keys: set[Tuple[Any, ...]],
     nodes_included: set[str],
     stop_id: Optional[str],
+    max_hops: Optional[int],
 ) -> None:
     incoming: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for rel in reference_edges:
@@ -644,13 +705,15 @@ def _append_reference_edges_full(
         if target_id:
             incoming[target_id].append(rel)
 
-    queue: deque[str] = deque([start_id])
+    queue: deque[Tuple[str, int]] = deque([(start_id, 0)])
     visited: set[str] = set()
     while queue:
-        node_id = queue.popleft()
+        node_id, depth = queue.popleft()
         if node_id in visited:
             continue
         visited.add(node_id)
+        if max_hops is not None and depth >= max_hops:
+            continue
         for rel in refs_outgoing.get(node_id, []):
             _append_reference_edge(
                 rel,
@@ -663,7 +726,7 @@ def _append_reference_edges_full(
             target_id = rel.get("target_stable_id")
             if target_id and target_id not in visited:
                 display_nodes.add(target_id)
-                queue.append(target_id)
+                queue.append((target_id, depth + 1))
         for rel in incoming.get(node_id, []):
             _append_reference_edge(
                 rel,
@@ -676,7 +739,7 @@ def _append_reference_edges_full(
             source_id = rel["source_stable_id"]
             if source_id and source_id not in visited:
                 display_nodes.add(source_id)
-                queue.append(source_id)
+                queue.append((source_id, depth + 1))
 
 
 def _append_reference_edge(
@@ -797,6 +860,7 @@ def _serialize_node(node: dict) -> dict:
         "stable_id": node["stable_id"],
         "module": node.get("module"),
         "kind": node.get("kind"),
+        "target_type": node.get("target_type"),
         "file_path": node.get("file_path"),
         "signature": node.get("signature"),
         "members": node.get("member_names", []),

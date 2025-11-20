@@ -1,13 +1,15 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from graphrag.db import schema
 from graphrag.db.queries import get_entity_graph
 from graphrag.db.repository import MetadataRepository
 from graphrag.models.records import EntityRecord, RelationshipRecord
 
 
-def _entity(name: str, stable_id: str, path: str) -> EntityRecord:
+def _entity(name: str, stable_id: str, path: str, target_type: str = "app") -> EntityRecord:
     return EntityRecord(
         name=name,
         kind="class",
@@ -19,6 +21,7 @@ def _entity(name: str, stable_id: str, path: str) -> EntityRecord:
         signature=f"class {name}",
         code=f"class {name} {{}}",
         stable_id=stable_id,
+        target_type=target_type,
         members=[],
     )
 
@@ -270,4 +273,110 @@ def test_get_entity_graph_applies_feature_deletions(tmp_path):
     edge_set = {(edge["source"], edge["target"], edge["type"]) for edge in graph["edges"]}
     assert ("MyModulePresenter", "ObsoleteView", "strongReference") not in edge_set
     assert ("MyModulePresenter", "MyModuleViewController", "weakReference") in edge_set
+
+
+def test_get_entity_graph_limits_hops(tmp_path):
+    conn = sqlite3.connect(tmp_path / "hops.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    a = _entity("EntityA", "a", "Sources/A.swift")
+    b = _entity("EntityB", "b", "Sources/B.swift")
+    c = _entity("EntityC", "c", "Sources/C.swift")
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("hops", None, "master", True)
+    entity_map = repo.persist_entities(commit, [a, b, c])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=a.stable_id,
+                target_name=b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=b.stable_id,
+                target_name=c.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    limited_graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="EntityA",
+        include_sibling_subgraphs=True,
+        max_hops=1,
+    )
+    limited_edges = {
+        (edge["source"], edge["target"], edge["type"])
+        for edge in limited_graph["edges"]
+    }
+    assert ("EntityB", "EntityC", "strongReference") not in limited_edges
+    assert ("EntityA", "EntityB", "strongReference") in limited_edges
+
+
+def test_get_entity_graph_respects_target_type_filter(tmp_path):
+    conn = sqlite3.connect(tmp_path / "target-filter.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    presenter = _entity("MyModulePresenter", "presenter", "Sources/Presenter.swift", target_type="app")
+    presenter_tests = _entity(
+        "MyModulePresenterTests",
+        "presenter_tests",
+        "Tests/PresenterTests.swift",
+        target_type="test",
+    )
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("main", None, "master", True)
+    entity_map = repo.persist_entities(commit, [presenter, presenter_tests])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name="MyModuleAssembly",
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter_tests.stable_id,
+                target_name=presenter.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    graph_app = get_entity_graph(
+        conn,
+        None,
+        entity_name="MyModulePresenter",
+        target_type="app",
+    )
+    app_nodes = {node["name"] for node in graph_app["nodes"]}
+    assert "MyModulePresenterTests" not in app_nodes
+
+    with pytest.raises(ValueError):
+        get_entity_graph(
+            conn,
+            None,
+            entity_name="MyModulePresenterTests",
+            target_type="app",
+        )
+
+    graph_tests = get_entity_graph(
+        conn,
+        None,
+        entity_name="MyModulePresenterTests",
+        target_type="test",
+    )
+    test_nodes = {node["name"] for node in graph_tests["nodes"]}
+    assert test_nodes == {"MyModulePresenterTests"}
 
