@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from graphrag.indexer.dependencies import TuistDependenciesWorker
 from graphrag.indexer.swift_parser import SwiftParser
 
 
@@ -35,7 +36,27 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
     project_dir = tmp_path / "Features" / "MyModule"
     project_dir.mkdir(parents=True)
     (project_dir / "Project.swift").write_text(
-        'import ProjectDescription\nlet project = Project(name: "MyModule")\n'
+        """
+        import ProjectDescription
+
+        let project = Project(
+            name: "MyModule",
+            targets: [
+                Target(
+                    name: "MyModule",
+                    platform: .iOS,
+                    product: .app,
+                    sources: ["Sources/**"]
+                ),
+                Target(
+                    name: "MyModuleTests",
+                    platform: .iOS,
+                    product: .unitTests,
+                    sources: ["Tests/**"]
+                )
+            ]
+        )
+        """
     )
     source_dir = project_dir / "Sources"
     source_dir.mkdir()
@@ -103,11 +124,13 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
     extension MyModulePresenter: HasLogger {}
     """
     file_rel_path = Path("Features/MyModule/Sources/Module.swift")
-    parser = SwiftParser(project_root=tmp_path)
+    deps_worker = TuistDependenciesWorker(tmp_path)
+    parser = SwiftParser(project_root=tmp_path, dependencies=deps_worker)
     parsed = parser.parse(source_code, file_rel_path)
 
     assembly = next(r for r in parsed.entities if r.name == "MyModuleAssembly")
     assert assembly.module == "MyModule"
+    assert assembly.target_type == "app"
     rel_types = {(rel.edge_type, rel.target_name) for rel in parsed.relationships}
     assert ("creates", "MyModulePresenter") in rel_types
     assert ("strongReference", "ISomePresenter") in rel_types

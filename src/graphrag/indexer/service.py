@@ -13,11 +13,13 @@ from ..models.records import ParsedSource
 from .base import ParserRegistry
 from .git_utils import (
     changed_swift_files,
+    commit_exists,
     commits_since,
     file_content_at_commit,
     get_branch_head,
     open_repo,
 )
+from .dependencies import build_dependencies_worker
 from .swift_parser import SwiftParser
 
 
@@ -54,6 +56,8 @@ class IndexerService:
             schema.apply_schema(conn)
             store = MetadataRepository(conn)
             last_hash = store.latest_master_commit()
+        if last_hash and not commit_exists(self.repo, last_hash):
+            last_hash = None
         commits = commits_since(self.repo, last_hash, self.settings.default_branch)
         processed: List[str] = []
         if not commits:
@@ -95,7 +99,10 @@ class IndexerService:
 def build_registry(settings: Settings) -> ParserRegistry:
     registry = ParserRegistry()
     langs = set(settings.languages)
+    deps_worker = build_dependencies_worker(settings)
     if "swift" in langs:
-        registry.register(SwiftParser(project_root=settings.repo_path))
+        registry.register(
+            SwiftParser(project_root=settings.repo_path, dependencies=deps_worker)
+        )
     return registry
 

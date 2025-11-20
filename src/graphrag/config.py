@@ -12,6 +12,11 @@ class ParserOptions(BaseModel):
     include_doc_comments: bool = True
 
 
+class GraphOptions(BaseModel):
+    build_system: str = "tuist"
+    max_hops: int = Field(2, ge=1, le=10)
+
+
 class Settings(BaseModel):
     repo_path: Path = Field(default_factory=lambda: Path(".").resolve())
     db_path: Path = Field(default_factory=lambda: Path("graphrag.db").resolve())
@@ -19,6 +24,7 @@ class Settings(BaseModel):
     default_branch: str = "master"
     languages: List[str] = Field(default_factory=lambda: ["swift"])
     parser: dict[str, ParserOptions] = Field(default_factory=dict)
+    graph: GraphOptions = Field(default_factory=GraphOptions)
 
     @field_validator("repo_path", "db_path", "feature_db_path", mode="before")
     def _coerce_path(cls, value: str | Path) -> Path:
@@ -39,5 +45,7 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
     for lang, opts in parser_section.items():
         parser_options[lang] = ParserOptions(**opts)
     data["parser"] = parser_options
+    graph_section = data.get("graph", {})
+    data["graph"] = GraphOptions(**graph_section) if graph_section else GraphOptions()
     return Settings(**data)
 

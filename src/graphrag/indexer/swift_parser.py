@@ -9,6 +9,7 @@ from tree_sitter_swift import language as swift_language
 
 from ..models.records import EntityRecord, MemberRecord, ParsedSource, RelationshipRecord
 from .base import ParserAdapter
+from .dependencies import DependenciesWorker
 from .utils import ModuleResolver, compute_stable_id
 
 ENTITY_NODE_TYPES = {
@@ -46,10 +47,14 @@ CALL_EXPR_RE = re.compile(
 class SwiftParser(ParserAdapter):
     language = "swift"
 
-    def __init__(self, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path | None = None,
+        dependencies: DependenciesWorker | None = None,
+    ) -> None:
         self._language = Language(swift_language())
         self._parser = Parser(self._language)
-        self._module_resolver = ModuleResolver(project_root)
+        self._module_resolver = ModuleResolver(project_root, dependencies)
         self._known_entities: Dict[str, str] = {}
 
     def parse(self, source: str, path: Path) -> ParsedSource:
@@ -76,7 +81,8 @@ class SwiftParser(ParserAdapter):
             start_line = node.start_point[0] + 1
             end_line = node.end_point[0] + 1
             file_path = path
-            module = self._module_resolver.resolve(file_path)
+            module_meta = self._module_resolver.resolve_metadata(file_path)
+            module = module_meta.module
             stable_name = (
                 f"{entity_name}::extension::{path}:{start_line}"
                 if kind == "extension"
@@ -101,6 +107,7 @@ class SwiftParser(ParserAdapter):
                 stable_id=stable_id,
                 docstring=None,
                 extended_type=extended_type,
+                target_type=module_meta.target_type,
                 members=members,
             )
             records.append(record)
