@@ -4,7 +4,14 @@ from pathlib import Path
 import pytest
 
 from graphrag.db import schema
-from graphrag.db.queries import get_entity_graph, _load_entities, _load_relationships
+from graphrag.db.queries import (
+    get_entity_graph,
+    get_entity_graph_lazy,
+    _load_entities,
+    _load_relationships,
+    _load_single_entity_by_name,
+    _load_relationships_for_entity,
+)
 from graphrag.db.repository import MetadataRepository
 from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
 
@@ -700,5 +707,261 @@ def test_load_relationships_handles_null_target(tmp_path):
     assert len(external_refs) == 1
     assert external_refs[0]["target_entity_id"] is None
     assert external_refs[0]["target_stable_id"] is None
+    conn.close()
+
+
+# ============================================================================
+# Lazy Loading Tests
+# ============================================================================
+
+
+def test_get_entity_graph_lazy_basic(tmp_path):
+    """Verify lazy loading produces valid graph structure."""
+    conn = sqlite3.connect(tmp_path / "lazy.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    assembly = _entity("Assembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("Presenter", "presenter", "Sources/Presenter.swift")
+    view = _entity("View", "view", "Sources/View.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("lazy-test", None, "master", True)
+    entity_map = repo.persist_entities(commit, [assembly, presenter, view])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=view.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=view.stable_id,
+                target_name=presenter.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    repo.rebuild_latest_tables()
+    conn.commit()
+    
+    # Get graph using lazy loading
+    graph = get_entity_graph_lazy(
+        conn, None, entity_name="View", stop_name="Assembly"
+    )
+    
+    assert graph["entity"]["name"] == "View"
+    assert graph["stop_at"] == "Assembly"
+    
+    node_names = {n["name"] for n in graph["nodes"]}
+    assert "View" in node_names
+    assert "Presenter" in node_names
+    # Assembly is the stop node, should not be in nodes
+    assert "Assembly" not in node_names
+    
+    conn.close()
+
+
+def test_get_entity_graph_lazy_matches_standard(tmp_path):
+    """Verify lazy loading produces same result as standard loading."""
+    conn = sqlite3.connect(tmp_path / "lazy-match.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity_a = _entity("EntityA", "a", "Sources/A.swift")
+    entity_b = _entity("EntityB", "b", "Sources/B.swift")
+    entity_c = _entity("EntityC", "c", "Sources/C.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("match-test", None, "master", True)
+    entity_map = repo.persist_entities(commit, [entity_a, entity_b, entity_c])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name=entity_b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=entity_b.stable_id,
+                target_name=entity_c.name,
+                edge_type="weakReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    repo.rebuild_latest_tables()
+    conn.commit()
+    
+    # Get graph using both methods
+    standard_graph = get_entity_graph(
+        conn, None, entity_name="EntityA", use_fast_path=True
+    )
+    lazy_graph = get_entity_graph_lazy(
+        conn, None, entity_name="EntityA"
+    )
+    
+    # Compare node sets (lazy may have fewer if not reachable)
+    standard_nodes = {n["name"] for n in standard_graph["nodes"]}
+    lazy_nodes = {n["name"] for n in lazy_graph["nodes"]}
+    
+    # Lazy should have loaded all reachable nodes
+    assert "EntityA" in lazy_nodes
+    assert "EntityB" in lazy_nodes
+    
+    conn.close()
+
+
+def test_get_entity_graph_lazy_respects_max_hops(tmp_path):
+    """Verify lazy loading respects max_hops limit."""
+    conn = sqlite3.connect(tmp_path / "lazy-hops.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Create a chain: A -> B -> C -> D
+    entities = [
+        _entity("EntityA", "a", "Sources/A.swift"),
+        _entity("EntityB", "b", "Sources/B.swift"),
+        _entity("EntityC", "c", "Sources/C.swift"),
+        _entity("EntityD", "d", "Sources/D.swift"),
+    ]
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("hops-test", None, "master", True)
+    entity_map = repo.persist_entities(commit, entities)
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id="a",
+                target_name="EntityB",
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id="b",
+                target_name="EntityC",
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id="c",
+                target_name="EntityD",
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    repo.rebuild_latest_tables()
+    conn.commit()
+    
+    # Get graph with max_hops=1
+    graph = get_entity_graph_lazy(
+        conn, None, entity_name="EntityA", max_hops=1
+    )
+    
+    node_names = {n["name"] for n in graph["nodes"]}
+    
+    # Should only have A and B (one hop)
+    assert "EntityA" in node_names
+    assert "EntityB" in node_names
+    assert "EntityC" not in node_names
+    assert "EntityD" not in node_names
+    
+    conn.close()
+
+
+def test_load_single_entity_by_name(tmp_path):
+    """Verify _load_single_entity_by_name loads correct entity."""
+    conn = sqlite3.connect(tmp_path / "single.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity = _entity("UniqueEntity", "unique", "Sources/Unique.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("single-test", None, "master", True)
+    repo.persist_entities(commit, [entity])
+    repo.rebuild_latest_tables()
+    conn.commit()
+    
+    loaded = _load_single_entity_by_name(conn, "UniqueEntity", "master")
+    
+    assert loaded is not None
+    assert loaded["name"] == "UniqueEntity"
+    assert loaded["stable_id"] == "unique"
+    assert loaded["origin"] == "master"
+    
+    # Non-existent entity should return None
+    missing = _load_single_entity_by_name(conn, "NonExistent", "master")
+    assert missing is None
+    
+    conn.close()
+
+
+def test_load_relationships_for_entity_direction(tmp_path):
+    """Verify _load_relationships_for_entity respects direction."""
+    conn = sqlite3.connect(tmp_path / "rel-dir.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity_a = _entity("EntityA", "a", "Sources/A.swift")
+    entity_b = _entity("EntityB", "b", "Sources/B.swift")
+    entity_c = _entity("EntityC", "c", "Sources/C.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("dir-test", None, "master", True)
+    entity_map = repo.persist_entities(commit, [entity_a, entity_b, entity_c])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            # A -> B (outgoing from A, incoming to B)
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name=entity_b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+            # C -> A (incoming to A, outgoing from C)
+            RelationshipRecord(
+                source_stable_id=entity_c.stable_id,
+                target_name=entity_a.name,
+                edge_type="weakReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    repo.rebuild_latest_tables()
+    conn.commit()
+    
+    # Downstream from A: should only get A -> B
+    downstream = _load_relationships_for_entity(conn, None, "a", "downstream")
+    assert len(downstream) == 1
+    assert downstream[0]["target_name"] == "EntityB"
+    
+    # Upstream to A: should only get C -> A
+    upstream = _load_relationships_for_entity(conn, None, "a", "upstream")
+    assert len(upstream) == 1
+    assert upstream[0]["source_name"] == "EntityC"
+    
+    # Both: should get both relationships
+    both = _load_relationships_for_entity(conn, None, "a", "both")
+    assert len(both) == 2
+    
     conn.close()
 

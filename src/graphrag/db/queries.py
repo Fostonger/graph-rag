@@ -367,6 +367,395 @@ def _load_relationships_fast(
     return relationships
 
 
+# ============================================================================
+# Lazy Loading Functions - On-demand entity/relationship loading
+# ============================================================================
+
+
+def get_entity_graph_lazy(
+    master_conn: sqlite3.Connection,
+    feature_conn: Optional[sqlite3.Connection],
+    entity_name: str,
+    stop_name: Optional[str] = None,
+    direction: str = "both",
+    max_hops: Optional[int] = None,
+    target_type: str = "app",
+) -> dict:
+    """Build a graph using lazy loading - only fetches reachable entities.
+    
+    This function traverses the graph on-demand, loading only the entities
+    and relationships that are reachable from the start entity. This is
+    significantly faster for large databases when the resulting graph is small.
+    
+    Args:
+        master_conn: Connection to master database
+        feature_conn: Optional connection to feature database
+        entity_name: Name of the entity to center the graph on
+        stop_name: Optional entity name to stop traversal at
+        direction: Graph traversal direction (upstream, downstream, both)
+        max_hops: Maximum number of hops from start entity
+        target_type: Filter by target type (app, test, all)
+    
+    Returns:
+        Graph payload with nodes and edges
+    
+    Note:
+        This function does not support include_sibling_subgraphs as the lazy
+        approach loads only directly reachable entities.
+    """
+    direction = (direction or "both").lower()
+    if direction not in {"upstream", "downstream", "both"}:
+        raise ValueError("direction must be one of upstream, downstream, both")
+    
+    target_type = (target_type or "app").lower()
+    if target_type not in {"app", "test", "all"}:
+        raise ValueError("targetType must be one of app, test, all")
+    
+    # Find the starting entity
+    start_node = _load_single_entity_by_name(master_conn, entity_name, "master")
+    if not start_node and feature_conn:
+        start_node = _load_single_entity_by_name(feature_conn, entity_name, "feature")
+    
+    if not start_node:
+        raise ValueError(f"Entity '{entity_name}' was not found in indexed metadata")
+    
+    if not _matches_target_filter(start_node, target_type):
+        raise ValueError(
+            f"Entity '{entity_name}' does not belong to targetType '{target_type}'"
+        )
+    
+    # Find stop node if specified
+    stop_node = None
+    stop_id = None
+    if stop_name:
+        stop_node = _load_single_entity_by_name(master_conn, stop_name, "master")
+        if not stop_node and feature_conn:
+            stop_node = _load_single_entity_by_name(feature_conn, stop_name, "feature")
+        if stop_node:
+            stop_id = stop_node["stable_id"]
+    
+    # Lazy traversal
+    visited_entities: Dict[str, dict] = {start_node["stable_id"]: start_node}
+    visited_edge_keys: Set[Tuple[Any, ...]] = set()
+    edges_payload: List[dict] = []
+    
+    # BFS queue: (stable_id, depth, direction_tag)
+    queue: deque[Tuple[str, int, str]] = deque([(start_node["stable_id"], 0, "start")])
+    
+    while queue:
+        current_id, depth, dir_tag = queue.popleft()
+        
+        if max_hops is not None and depth >= max_hops:
+            continue
+        
+        if current_id == stop_id:
+            continue
+        
+        # Load relationships for this entity
+        rels = _load_relationships_for_entity(
+            master_conn, feature_conn, current_id, direction
+        )
+        
+        for rel in rels:
+            # Skip if doesn't match target type
+            target_id = rel.get("target_stable_id")
+            source_id = rel["source_stable_id"]
+            
+            # Build edge key for deduplication
+            edge_key = (
+                source_id,
+                target_id,
+                rel["target_name"],
+                rel["edge_type"],
+            )
+            if edge_key in visited_edge_keys:
+                continue
+            visited_edge_keys.add(edge_key)
+            
+            # Add edge to payload
+            metadata = dict(rel.get("metadata") or {})
+            metadata["origin"] = rel.get("origin", "master")
+            edge = {
+                "type": rel["edge_type"],
+                "source": rel.get("source_name") or source_id,
+                "target": rel.get("target_entity_name") or rel["target_name"],
+                "metadata": metadata,
+            }
+            edges_payload.append(edge)
+            
+            # Load and queue target entity if not visited
+            if target_id and target_id not in visited_entities and target_id != stop_id:
+                target_entity = _load_single_entity_by_stable_id(
+                    master_conn, feature_conn, target_id
+                )
+                if target_entity and _matches_target_filter(target_entity, target_type):
+                    visited_entities[target_id] = target_entity
+                    queue.append((target_id, depth + 1, "downstream"))
+            
+            # For upstream/both, also follow incoming edges
+            if direction in {"upstream", "both"} and source_id not in visited_entities:
+                if source_id != stop_id:
+                    source_entity = _load_single_entity_by_stable_id(
+                        master_conn, feature_conn, source_id
+                    )
+                    if source_entity and _matches_target_filter(source_entity, target_type):
+                        visited_entities[source_id] = source_entity
+                        queue.append((source_id, depth + 1, "upstream"))
+    
+    # Build node payloads
+    node_payloads = [
+        _serialize_node(entity)
+        for entity in sorted(
+            visited_entities.values(),
+            key=lambda e: e["name"],
+        )
+        if entity["stable_id"] != stop_id
+    ]
+    
+    return {
+        "entity": _summarize_node(start_node),
+        "stop_at": stop_node["name"] if stop_node else None,
+        "direction": direction,
+        "include_sibling_subgraphs": False,
+        "edges": edges_payload,
+        "nodes": node_payloads,
+        "target_type_filter": target_type,
+        "max_hops": max_hops,
+    }
+
+
+def _load_single_entity_by_name(
+    conn: sqlite3.Connection, name: str, origin: str
+) -> Optional[dict]:
+    """Load a single entity by name from entity_latest table."""
+    if conn is None:
+        return None
+    
+    row = conn.execute(
+        """
+        SELECT
+            stable_id,
+            entity_id,
+            name,
+            kind,
+            module,
+            file_path,
+            signature,
+            properties,
+            member_names,
+            target_type,
+            commit_hash
+        FROM entity_latest
+        WHERE name = ?
+        LIMIT 1
+        """,
+        (name,),
+    ).fetchone()
+    
+    if not row:
+        return None
+    
+    member_names = row["member_names"].split("|") if row["member_names"] else []
+    return {
+        "entity_id": int(row["entity_id"]),
+        "stable_id": row["stable_id"],
+        "name": row["name"],
+        "kind": row["kind"],
+        "module": row["module"],
+        "file_path": row["file_path"],
+        "signature": row["signature"],
+        "commit_hash": row["commit_hash"],
+        "member_names": member_names,
+        "origin": origin,
+        "target_type": row["target_type"],
+    }
+
+
+def _load_single_entity_by_stable_id(
+    master_conn: sqlite3.Connection,
+    feature_conn: Optional[sqlite3.Connection],
+    stable_id: str,
+) -> Optional[dict]:
+    """Load a single entity by stable_id, checking feature first."""
+    # Check feature first (overlay)
+    if feature_conn:
+        row = feature_conn.execute(
+            """
+            SELECT
+                stable_id,
+                entity_id,
+                name,
+                kind,
+                module,
+                file_path,
+                signature,
+                properties,
+                member_names,
+                target_type,
+                commit_hash
+            FROM entity_latest
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+        if row:
+            member_names = row["member_names"].split("|") if row["member_names"] else []
+            return {
+                "entity_id": int(row["entity_id"]),
+                "stable_id": row["stable_id"],
+                "name": row["name"],
+                "kind": row["kind"],
+                "module": row["module"],
+                "file_path": row["file_path"],
+                "signature": row["signature"],
+                "commit_hash": row["commit_hash"],
+                "member_names": member_names,
+                "origin": "feature",
+                "target_type": row["target_type"],
+            }
+    
+    # Fall back to master
+    if master_conn:
+        row = master_conn.execute(
+            """
+            SELECT
+                stable_id,
+                entity_id,
+                name,
+                kind,
+                module,
+                file_path,
+                signature,
+                properties,
+                member_names,
+                target_type,
+                commit_hash
+            FROM entity_latest
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+        if row:
+            member_names = row["member_names"].split("|") if row["member_names"] else []
+            return {
+                "entity_id": int(row["entity_id"]),
+                "stable_id": row["stable_id"],
+                "name": row["name"],
+                "kind": row["kind"],
+                "module": row["module"],
+                "file_path": row["file_path"],
+                "signature": row["signature"],
+                "commit_hash": row["commit_hash"],
+                "member_names": member_names,
+                "origin": "master",
+                "target_type": row["target_type"],
+            }
+    
+    return None
+
+
+def _load_relationships_for_entity(
+    master_conn: sqlite3.Connection,
+    feature_conn: Optional[sqlite3.Connection],
+    stable_id: str,
+    direction: str,
+) -> List[Dict[str, Any]]:
+    """Load relationships for a single entity based on direction.
+    
+    Args:
+        master_conn: Master database connection
+        feature_conn: Optional feature database connection
+        stable_id: Entity stable_id to load relationships for
+        direction: 'upstream' (incoming), 'downstream' (outgoing), or 'both'
+    
+    Returns:
+        List of relationship dictionaries
+    """
+    relationships: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[Any, ...]] = set()
+    
+    def add_rels_from_conn(conn: sqlite3.Connection, origin: str) -> None:
+        if conn is None:
+            return
+        
+        # Build query based on direction
+        if direction == "downstream":
+            query = """
+                SELECT
+                    source_stable_id,
+                    source_name,
+                    target_stable_id,
+                    target_name,
+                    target_module,
+                    edge_type,
+                    metadata
+                FROM relationship_latest
+                WHERE source_stable_id = ?
+            """
+            params = (stable_id,)
+        elif direction == "upstream":
+            query = """
+                SELECT
+                    source_stable_id,
+                    source_name,
+                    target_stable_id,
+                    target_name,
+                    target_module,
+                    edge_type,
+                    metadata
+                FROM relationship_latest
+                WHERE target_stable_id = ?
+            """
+            params = (stable_id,)
+        else:  # both
+            query = """
+                SELECT
+                    source_stable_id,
+                    source_name,
+                    target_stable_id,
+                    target_name,
+                    target_module,
+                    edge_type,
+                    metadata
+                FROM relationship_latest
+                WHERE source_stable_id = ? OR target_stable_id = ?
+            """
+            params = (stable_id, stable_id)
+        
+        rows = conn.execute(query, params).fetchall()
+        
+        for row in rows:
+            key = (
+                row["source_stable_id"],
+                row["target_stable_id"],
+                row["target_name"],
+                row["edge_type"],
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            relationships.append({
+                "source_stable_id": row["source_stable_id"],
+                "source_name": row["source_name"],
+                "target_stable_id": row["target_stable_id"],
+                "target_name": row["target_name"],
+                "target_module": row["target_module"],
+                "target_entity_name": row["target_name"],
+                "edge_type": row["edge_type"],
+                "metadata": metadata,
+                "origin": origin,
+            })
+    
+    # Feature relationships overlay master
+    if feature_conn:
+        add_rels_from_conn(feature_conn, "feature")
+    add_rels_from_conn(master_conn, "master")
+    
+    return relationships
+
+
 def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dict], Set[str]]:
     """Load all entities with their latest version state.
     
