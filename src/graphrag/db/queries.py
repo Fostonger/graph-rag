@@ -187,18 +187,47 @@ def get_entity_graph(
     include_sibling_subgraphs: bool = False,
     max_hops: Optional[int] = None,
     target_type: str = "app",
+    use_fast_path: bool = False,
 ) -> dict:
+    """Build a graph centered on the specified entity.
+    
+    Args:
+        master_conn: Connection to master database
+        feature_conn: Optional connection to feature database for overlay
+        entity_name: Name of the entity to center the graph on
+        stop_name: Optional entity name to stop traversal at
+        direction: Graph traversal direction (upstream, downstream, both)
+        include_sibling_subgraphs: Include sibling entity subgraphs
+        max_hops: Maximum number of hops from start entity
+        target_type: Filter by target type (app, test, all)
+        use_fast_path: Use materialized views for faster loading (master only)
+    
+    Returns:
+        Graph payload with nodes and edges
+    """
     direction = (direction or "both").lower()
     if direction not in {"upstream", "downstream", "both"}:
         raise ValueError("direction must be one of upstream, downstream, both")
-    master_entities, master_deleted = _load_entities(master_conn, "master")
+    
+    # Load entities and relationships
+    if use_fast_path and feature_conn is None:
+        # Fast path: use materialized views (master only, no feature overlay)
+        master_entities = _load_entities_fast(master_conn, "master")
+        master_deleted: Set[str] = set()  # No tombstones in fast path
+        master_rels = _load_relationships_fast(master_conn, "master")
+        master_rel_deleted: Set[Tuple[Any, ...]] = set()
+    else:
+        # Standard path: use versioned tables
+        master_entities, master_deleted = _load_entities(master_conn, "master")
+        master_rels, master_rel_deleted = _load_relationships(master_conn, "master")
+    
     feature_entities, feature_deleted = (
         _load_entities(feature_conn, "feature") if feature_conn else ({}, set())
     )
     entities = _merge_entities(
         master_entities, feature_entities, master_deleted, feature_deleted
     )
-    master_rels, master_rel_deleted = _load_relationships(master_conn, "master")
+    
     feature_rels, feature_rel_deleted = (
         _load_relationships(feature_conn, "feature") if feature_conn else ([], set())
     )
@@ -240,6 +269,102 @@ def get_entity_graph(
     graph_payload["target_type_filter"] = target_type
     graph_payload["max_hops"] = max_hops
     return graph_payload
+
+
+def _load_entities_fast(conn: sqlite3.Connection, origin: str) -> Dict[str, dict]:
+    """Load entities from materialized entity_latest table.
+    
+    This is significantly faster than _load_entities() as it reads from
+    a pre-computed denormalized table with no joins or aggregations.
+    
+    Note: Returns only entities dict, no tombstones (materialized view
+    only contains non-deleted entities).
+    """
+    if conn is None:
+        return {}
+    
+    rows = conn.execute(
+        """
+        SELECT
+            stable_id,
+            entity_id,
+            name,
+            kind,
+            module,
+            file_path,
+            signature,
+            properties,
+            member_names,
+            target_type,
+            commit_hash
+        FROM entity_latest
+        """
+    ).fetchall()
+    
+    entities: Dict[str, dict] = {}
+    for row in rows:
+        member_names = row["member_names"].split("|") if row["member_names"] else []
+        entities[row["stable_id"]] = {
+            "entity_id": int(row["entity_id"]),
+            "stable_id": row["stable_id"],
+            "name": row["name"],
+            "kind": row["kind"],
+            "module": row["module"],
+            "file_path": row["file_path"],
+            "signature": row["signature"],
+            "commit_hash": row["commit_hash"],
+            "member_names": member_names,
+            "origin": origin,
+            "target_type": row["target_type"],
+        }
+    return entities
+
+
+def _load_relationships_fast(
+    conn: sqlite3.Connection, origin: str
+) -> List[Dict[str, Any]]:
+    """Load relationships from materialized relationship_latest table.
+    
+    This is significantly faster than _load_relationships() as it reads from
+    a pre-computed denormalized table with no complex window functions.
+    
+    Note: Returns only relationships list, no tombstones (materialized view
+    only contains non-deleted relationships).
+    """
+    if conn is None:
+        return []
+    
+    rows = conn.execute(
+        """
+        SELECT
+            source_stable_id,
+            source_name,
+            target_stable_id,
+            target_name,
+            target_module,
+            edge_type,
+            metadata
+        FROM relationship_latest
+        """
+    ).fetchall()
+    
+    relationships: List[Dict[str, Any]] = []
+    for row in rows:
+        metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        relationships.append({
+            "source_entity_id": None,  # Not needed for graph building
+            "target_entity_id": None,
+            "target_name": row["target_name"],
+            "target_module": row["target_module"],
+            "edge_type": row["edge_type"],
+            "metadata": metadata,
+            "source_stable_id": row["source_stable_id"],
+            "source_name": row["source_name"],
+            "target_stable_id": row["target_stable_id"],
+            "target_entity_name": row["target_name"],
+            "origin": origin,
+        })
+    return relationships
 
 
 def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dict], Set[str]]:

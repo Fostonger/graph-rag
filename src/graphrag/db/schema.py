@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def apply_schema(conn: sqlite3.Connection) -> None:
@@ -231,6 +231,59 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_relationships_commit
             ON entity_relationships(commit_id, is_deleted);
+        """
+    )
+
+    # Materialized views for fast graph queries (added in schema v3)
+    # These tables store pre-computed latest state and are rebuilt during indexing
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entity_latest (
+            stable_id TEXT PRIMARY KEY,
+            entity_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            module TEXT,
+            file_path TEXT,
+            signature TEXT,
+            properties TEXT,
+            member_names TEXT,
+            target_type TEXT,
+            commit_hash TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relationship_latest (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_stable_id TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            target_stable_id TEXT,
+            target_name TEXT NOT NULL,
+            target_module TEXT,
+            edge_type TEXT NOT NULL,
+            metadata TEXT,
+            UNIQUE(source_stable_id, target_stable_id, target_name, target_module, edge_type)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_latest_name
+            ON entity_latest(name);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationship_latest_source
+            ON relationship_latest(source_stable_id);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationship_latest_target
+            ON relationship_latest(target_stable_id);
         """
     )
 

@@ -479,3 +479,117 @@ class MetadataRepository:
             ),
         )
 
+    def rebuild_latest_tables(self) -> None:
+        """Rebuild the materialized entity_latest and relationship_latest tables.
+        
+        This should be called after indexing to update the denormalized views
+        that enable fast graph queries without complex joins.
+        """
+        # Clear existing data
+        self.conn.execute("DELETE FROM entity_latest;")
+        self.conn.execute("DELETE FROM relationship_latest;")
+        
+        # Rebuild entity_latest from versioned data
+        self.conn.execute(
+            """
+            INSERT INTO entity_latest (
+                stable_id, entity_id, name, kind, module, file_path,
+                signature, properties, member_names, target_type, commit_hash
+            )
+            WITH latest AS (
+                SELECT entity_id, MAX(commit_id) AS commit_id
+                FROM entity_versions
+                GROUP BY entity_id
+            ),
+            member_agg AS (
+                SELECT entity_id, GROUP_CONCAT(name, '|') AS names
+                FROM members
+                GROUP BY entity_id
+            )
+            SELECT
+                e.stable_id,
+                e.id,
+                e.name,
+                e.kind,
+                e.module,
+                f.path,
+                ev.signature,
+                ev.properties,
+                COALESCE(ma.names, ''),
+                json_extract(ev.properties, '$.target_type'),
+                c.hash
+            FROM latest
+            JOIN entity_versions ev
+                ON ev.entity_id = latest.entity_id
+               AND ev.commit_id = latest.commit_id
+            JOIN entities e ON e.id = latest.entity_id
+            LEFT JOIN files f ON f.id = ev.file_id
+            LEFT JOIN member_agg ma ON ma.entity_id = e.id
+            JOIN commits c ON c.id = ev.commit_id
+            WHERE ev.is_deleted = 0
+            """
+        )
+        
+        # Rebuild relationship_latest from versioned data
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO relationship_latest (
+                source_stable_id, source_name, target_stable_id,
+                target_name, target_module, edge_type, metadata
+            )
+            WITH latest AS (
+                SELECT
+                    source_entity_id,
+                    COALESCE(target_entity_id, -1) AS target_entity_id_key,
+                    target_name,
+                    COALESCE(target_module, '') AS target_module_key,
+                    edge_type,
+                    MAX(commit_id) AS max_commit_id
+                FROM entity_relationships
+                GROUP BY
+                    source_entity_id,
+                    COALESCE(target_entity_id, -1),
+                    target_name,
+                    COALESCE(target_module, ''),
+                    edge_type
+            ),
+            latest_rel AS (
+                SELECT
+                    er.source_entity_id,
+                    er.target_entity_id,
+                    er.target_name,
+                    er.target_module,
+                    er.edge_type,
+                    er.metadata,
+                    er.is_deleted,
+                    MAX(er.id) AS id
+                FROM latest
+                JOIN entity_relationships er ON
+                    er.source_entity_id = latest.source_entity_id
+                    AND COALESCE(er.target_entity_id, -1) = latest.target_entity_id_key
+                    AND er.target_name = latest.target_name
+                    AND COALESCE(er.target_module, '') = latest.target_module_key
+                    AND er.edge_type = latest.edge_type
+                    AND er.commit_id = latest.max_commit_id
+                GROUP BY
+                    er.source_entity_id,
+                    er.target_entity_id,
+                    er.target_name,
+                    er.target_module,
+                    er.edge_type
+            )
+            SELECT
+                src.stable_id,
+                src.name,
+                tgt.stable_id,
+                lr.target_name,
+                lr.target_module,
+                lr.edge_type,
+                lr.metadata
+            FROM latest_rel lr
+            JOIN entities src ON src.id = lr.source_entity_id
+            LEFT JOIN entities tgt ON tgt.id = lr.target_entity_id
+            WHERE lr.is_deleted = 0
+            """
+        )
+
