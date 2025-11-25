@@ -39,18 +39,16 @@ def test_swift_parser_relationships_and_module_resolution(tmp_path):
         """
         import ProjectDescription
 
-        let project = Project(
+        let project = MyModule.Module(
             name: "MyModule",
             targets: [
-                Target(
+                MyModule.Module.Target(
                     name: "MyModule",
-                    platform: .iOS,
                     product: .app,
                     sources: ["Sources/**"]
                 ),
-                Target(
+                MyModule.Module.Target(
                     name: "MyModuleTests",
-                    platform: .iOS,
                     product: .unitTests,
                     sources: ["Tests/**"]
                 )
@@ -149,16 +147,16 @@ def test_dependencies_worker_handles_shared_prefixes(tmp_path):
         """
         import ProjectDescription
 
-        let project = Project(
+        let project = MyModule.Module(
             name: "Workspace",
             targets: [
-                Target(
+                MyModule.Module.Target(
                     name: "App",
                     platform: .iOS,
                     product: .app,
                     sources: ["Modules/App/Sources/**"]
                 ),
-                Target(
+                MyModule.Module.Target(
                     name: "AppTests",
                     platform: .iOS,
                     product: .unitTests,
