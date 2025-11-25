@@ -325,42 +325,90 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
 def _load_relationships(
     conn: sqlite3.Connection, origin: str
 ) -> Tuple[List[Dict[str, Any]], Set[Tuple[Any, ...]]]:
+    """Load all relationships with their latest version state.
+    
+    Optimized to use MAX aggregation instead of ROW_NUMBER() window function.
+    The MAX approach leverages indexes better and avoids full table sorting.
+    """
     if conn is None:
         return [], set()
+    
+    # Use MAX to find the latest version of each unique relationship
+    # This is more efficient than ROW_NUMBER() as it can use indexes
     rows = conn.execute(
         """
-        WITH ranked AS (
+        WITH latest AS (
             SELECT
-                er.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY
-                        er.source_entity_id,
-                        COALESCE(er.target_entity_id, -1),
-                        er.target_name,
-                        COALESCE(er.target_module, ''),
-                        er.edge_type
-                    ORDER BY er.commit_id DESC, er.id DESC
-                ) AS rn
-            FROM entity_relationships er
+                source_entity_id,
+                COALESCE(target_entity_id, -1) AS target_entity_id_key,
+                target_name,
+                COALESCE(target_module, '') AS target_module_key,
+                edge_type,
+                MAX(commit_id) AS max_commit_id
+            FROM entity_relationships
+            GROUP BY
+                source_entity_id,
+                COALESCE(target_entity_id, -1),
+                target_name,
+                COALESCE(target_module, ''),
+                edge_type
+        ),
+        latest_with_id AS (
+            SELECT
+                er.id,
+                er.source_entity_id,
+                er.target_entity_id,
+                er.target_name,
+                er.target_module,
+                er.edge_type,
+                er.metadata,
+                er.is_deleted
+            FROM latest
+            JOIN entity_relationships er ON
+                er.source_entity_id = latest.source_entity_id
+                AND COALESCE(er.target_entity_id, -1) = latest.target_entity_id_key
+                AND er.target_name = latest.target_name
+                AND COALESCE(er.target_module, '') = latest.target_module_key
+                AND er.edge_type = latest.edge_type
+                AND er.commit_id = latest.max_commit_id
+        ),
+        deduplicated AS (
+            SELECT
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                target_module,
+                edge_type,
+                metadata,
+                is_deleted,
+                MAX(id) AS id
+            FROM latest_with_id
+            GROUP BY
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                target_module,
+                edge_type
         )
         SELECT
-            ranked.source_entity_id,
-            ranked.target_entity_id,
-            ranked.target_name,
-            ranked.target_module,
-            ranked.edge_type,
-            ranked.metadata,
-            ranked.is_deleted,
+            d.source_entity_id,
+            d.target_entity_id,
+            d.target_name,
+            d.target_module,
+            d.edge_type,
+            lwi.metadata,
+            lwi.is_deleted,
             src.stable_id AS source_stable_id,
             src.name AS source_name,
             tgt.stable_id AS target_stable_id,
             tgt.name AS target_entity_name
-        FROM ranked
-        JOIN entities src ON src.id = ranked.source_entity_id
-        LEFT JOIN entities tgt ON tgt.id = ranked.target_entity_id
-        WHERE ranked.rn = 1
+        FROM deduplicated d
+        JOIN latest_with_id lwi ON lwi.id = d.id
+        JOIN entities src ON src.id = d.source_entity_id
+        LEFT JOIN entities tgt ON tgt.id = d.target_entity_id
         """
     ).fetchall()
+    
     relationships: List[Dict[str, Any]] = []
     tombstones: Set[Tuple[Any, ...]] = set()
     for row in rows:

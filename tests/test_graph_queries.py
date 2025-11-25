@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from graphrag.db import schema
-from graphrag.db.queries import get_entity_graph, _load_entities
+from graphrag.db.queries import get_entity_graph, _load_entities, _load_relationships
 from graphrag.db.repository import MetadataRepository
 from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
 
@@ -567,5 +567,138 @@ def test_load_entities_batch_performance(tmp_path):
         assert len(entity["member_names"]) == 5
         assert f"method0" in entity["member_names"]
     
+    conn.close()
+
+
+def test_load_relationships_deduplicates_by_latest_commit(tmp_path):
+    """Verify that _load_relationships returns only the latest version of each relationship."""
+    conn = sqlite3.connect(tmp_path / "rel-dedup.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity_a = _entity("EntityA", "a", "Sources/A.swift")
+    entity_b = _entity("EntityB", "b", "Sources/B.swift")
+    
+    repo = MetadataRepository(conn)
+    
+    # First commit: Create relationship with some metadata
+    commit1 = repo.record_commit("commit1", None, "master", True)
+    entity_map1 = repo.persist_entities(commit1, [entity_a, entity_b])
+    repo.persist_relationships(
+        commit1,
+        entity_map1,
+        [
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name=entity_b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+                metadata={"version": 1},
+            ),
+        ],
+    )
+    
+    # Second commit: Update same relationship with new metadata
+    commit2 = repo.record_commit("commit2", "commit1", "master", True)
+    entity_map2 = repo.persist_entities(commit2, [entity_a])
+    repo.persist_relationships(
+        commit2,
+        entity_map2,
+        [
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name=entity_b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+                metadata={"version": 2},
+            ),
+        ],
+    )
+    conn.commit()
+    
+    relationships, tombstones = _load_relationships(conn, "master")
+    
+    # Should have exactly one relationship (the latest version)
+    strong_refs = [r for r in relationships if r["edge_type"] == "strongReference"]
+    assert len(strong_refs) == 1
+    assert strong_refs[0]["metadata"]["version"] == 2
+    conn.close()
+
+
+def test_load_relationships_handles_tombstones(tmp_path):
+    """Verify that _load_relationships correctly identifies deleted relationships."""
+    conn = sqlite3.connect(tmp_path / "rel-tomb.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity_a = _entity("EntityA", "a", "Sources/A.swift")
+    entity_b = _entity("EntityB", "b", "Sources/B.swift")
+    
+    repo = MetadataRepository(conn)
+    
+    # First commit: Create relationship
+    commit1 = repo.record_commit("commit1", None, "master", True)
+    entity_map = repo.persist_entities(commit1, [entity_a, entity_b])
+    repo.persist_relationships(
+        commit1,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name=entity_b.name,
+                edge_type="strongReference",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    
+    # Second commit: Entity A is deleted (which tombstones its relationships)
+    commit2 = repo.record_commit("commit2", "commit1", "master", True)
+    repo.mark_entities_deleted_for_file(Path("Sources/A.swift"), commit2)
+    conn.commit()
+    
+    relationships, tombstones = _load_relationships(conn, "master")
+    
+    # The relationship should be in tombstones, not in active relationships
+    active_refs = [r for r in relationships if r["source_name"] == "EntityA"]
+    assert len(active_refs) == 0
+    assert len(tombstones) > 0
+    conn.close()
+
+
+def test_load_relationships_handles_null_target(tmp_path):
+    """Verify that _load_relationships correctly handles relationships with null target_entity_id."""
+    conn = sqlite3.connect(tmp_path / "rel-null.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity_a = _entity("EntityA", "a", "Sources/A.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("commit1", None, "master", True)
+    entity_map = repo.persist_entities(commit, [entity_a])
+    
+    # Create relationship to an external entity (not in our DB)
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=entity_a.stable_id,
+                target_name="ExternalClass",
+                edge_type="superclass",
+                target_module="ExternalModule",
+            ),
+        ],
+    )
+    conn.commit()
+    
+    relationships, _ = _load_relationships(conn, "master")
+    
+    # Should have the relationship even though target doesn't exist in DB
+    external_refs = [r for r in relationships if r["target_name"] == "ExternalClass"]
+    assert len(external_refs) == 1
+    assert external_refs[0]["target_entity_id"] is None
+    assert external_refs[0]["target_stable_id"] is None
     conn.close()
 
