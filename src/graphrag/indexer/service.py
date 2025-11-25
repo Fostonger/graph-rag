@@ -13,7 +13,6 @@ from ..models.records import ParsedSource
 from .base import ParserRegistry
 from .git_utils import (
     changed_swift_files,
-    commit_exists,
     commits_since,
     file_content_at_commit,
     get_branch_head,
@@ -56,8 +55,6 @@ class IndexerService:
             schema.apply_schema(conn)
             store = MetadataRepository(conn)
             last_hash = store.latest_master_commit()
-        if last_hash and not commit_exists(self.repo, last_hash):
-            last_hash = None
         commits = commits_since(self.repo, last_hash, self.settings.default_branch)
         processed: List[str] = []
         if not commits:
