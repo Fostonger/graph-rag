@@ -243,8 +243,16 @@ def get_entity_graph(
 
 
 def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dict], Set[str]]:
+    """Load all entities with their latest version state.
+    
+    Optimized to use 2 queries instead of N+1 pattern:
+    1. Load entities without member names
+    2. Batch load all member names and join in Python
+    """
     if conn is None:
         return {}, set()
+    
+    # Query 1: Load all entities without the correlated subquery
     rows = conn.execute(
         """
         WITH latest AS (
@@ -262,12 +270,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             ev.signature,
             commits.hash AS commit_hash,
             ev.is_deleted,
-            ev.properties,
-            (
-                SELECT GROUP_CONCAT(m.name, '|')
-                FROM members m
-                WHERE m.entity_id = e.id
-            ) AS member_names
+            ev.properties
         FROM latest
         JOIN entity_versions ev
             ON ev.entity_id = latest.entity_id
@@ -277,6 +280,24 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
         JOIN commits ON commits.id = ev.commit_id
         """
     ).fetchall()
+    
+    # Query 2: Batch load all member names in a single query
+    member_rows = conn.execute(
+        """
+        SELECT entity_id, GROUP_CONCAT(name, '|') AS names
+        FROM members
+        GROUP BY entity_id
+        """
+    ).fetchall()
+    
+    # Build member name lookup map
+    member_map: Dict[int, List[str]] = {}
+    for row in member_rows:
+        entity_id = int(row["entity_id"])
+        names_str = row["names"]
+        member_map[entity_id] = names_str.split("|") if names_str else []
+    
+    # Build entities dict
     entities: Dict[str, dict] = {}
     tombstones: Set[str] = set()
     for row in rows:
@@ -284,11 +305,9 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             tombstones.add(row["stable_id"])
             continue
         props = json.loads(row["properties"]) if row["properties"] else {}
-        member_names = (
-            row["member_names"].split("|") if row["member_names"] else []
-        )
+        entity_id = int(row["id"])
         entities[row["stable_id"]] = {
-            "entity_id": int(row["id"]),
+            "entity_id": entity_id,
             "stable_id": row["stable_id"],
             "name": row["name"],
             "kind": row["kind"],
@@ -296,7 +315,7 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             "file_path": row["file_path"],
             "signature": row["signature"],
             "commit_hash": row["commit_hash"],
-            "member_names": member_names,
+            "member_names": member_map.get(entity_id, []),
             "origin": origin,
             "target_type": props.get("target_type"),
         }

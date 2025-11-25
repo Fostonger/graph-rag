@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 
 from graphrag.db import schema
-from graphrag.db.queries import get_entity_graph
+from graphrag.db.queries import get_entity_graph, _load_entities
 from graphrag.db.repository import MetadataRepository
-from graphrag.models.records import EntityRecord, RelationshipRecord
+from graphrag.models.records import EntityRecord, MemberRecord, RelationshipRecord
 
 
 def _entity(name: str, stable_id: str, path: str, target_type: str = "app") -> EntityRecord:
@@ -414,4 +414,158 @@ def test_get_entity_graph_respects_target_type_filter(tmp_path):
     )
     test_nodes = {node["name"] for node in graph_tests["nodes"]}
     assert test_nodes == {"MyModulePresenterTests"}
+
+
+def _entity_with_members(
+    name: str, stable_id: str, path: str, members: list
+) -> EntityRecord:
+    """Create an entity with members for testing."""
+    return EntityRecord(
+        name=name,
+        kind="class",
+        module="MyModule",
+        language="swift",
+        file_path=Path(path),
+        start_line=1,
+        end_line=50,
+        signature=f"class {name}",
+        code=f"class {name} {{ ... }}",
+        stable_id=stable_id,
+        target_type="app",
+        members=members,
+    )
+
+
+def test_load_entities_includes_member_names(tmp_path):
+    """Verify that _load_entities correctly loads member names from batch query."""
+    conn = sqlite3.connect(tmp_path / "members.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Create entity with members
+    members = [
+        MemberRecord(
+            name="doSomething",
+            kind="method",
+            signature="func doSomething()",
+            code="func doSomething() {}",
+            start_line=10,
+            end_line=12,
+        ),
+        MemberRecord(
+            name="myProperty",
+            kind="property",
+            signature="var myProperty: String",
+            code="var myProperty: String = \"\"",
+            start_line=5,
+            end_line=5,
+        ),
+    ]
+    entity = _entity_with_members(
+        "MyClass", "myclass-stable", "Sources/MyClass.swift", members
+    )
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("test1", None, "master", True)
+    repo.persist_entities(commit, [entity])
+    conn.commit()
+    
+    # Load entities and check member names
+    entities, tombstones = _load_entities(conn, "master")
+    
+    assert len(entities) == 1
+    assert len(tombstones) == 0
+    
+    loaded = entities["myclass-stable"]
+    assert set(loaded["member_names"]) == {"doSomething", "myProperty"}
+    conn.close()
+
+
+def test_load_entities_handles_no_members(tmp_path):
+    """Verify that _load_entities works correctly for entities without members."""
+    conn = sqlite3.connect(tmp_path / "no-members.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity = _entity("EmptyClass", "empty-stable", "Sources/Empty.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("test1", None, "master", True)
+    repo.persist_entities(commit, [entity])
+    conn.commit()
+    
+    entities, tombstones = _load_entities(conn, "master")
+    
+    assert len(entities) == 1
+    loaded = entities["empty-stable"]
+    assert loaded["member_names"] == []
+    conn.close()
+
+
+def test_load_entities_handles_tombstones(tmp_path):
+    """Verify that _load_entities correctly identifies deleted entities."""
+    conn = sqlite3.connect(tmp_path / "tombstones.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    entity = _entity("DeletedClass", "deleted-stable", "Sources/Deleted.swift")
+    
+    repo = MetadataRepository(conn)
+    commit1 = repo.record_commit("commit1", None, "master", True)
+    repo.persist_entities(commit1, [entity])
+    
+    # Mark as deleted
+    commit2 = repo.record_commit("commit2", "commit1", "master", True)
+    repo.mark_entities_deleted_for_file(Path("Sources/Deleted.swift"), commit2)
+    conn.commit()
+    
+    entities, tombstones = _load_entities(conn, "master")
+    
+    assert "deleted-stable" not in entities
+    assert "deleted-stable" in tombstones
+    conn.close()
+
+
+def test_load_entities_batch_performance(tmp_path):
+    """Verify that _load_entities uses batch loading (2 queries, not N+1)."""
+    conn = sqlite3.connect(tmp_path / "perf.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Create many entities with members
+    entities_to_create = []
+    for i in range(100):
+        members = [
+            MemberRecord(
+                name=f"method{j}",
+                kind="method",
+                signature=f"func method{j}()",
+                code=f"func method{j}() {{}}",
+                start_line=j * 5,
+                end_line=j * 5 + 3,
+            )
+            for j in range(5)
+        ]
+        entity = _entity_with_members(
+            f"Class{i}", f"class-{i}", f"Sources/Class{i}.swift", members
+        )
+        entities_to_create.append(entity)
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("test", None, "master", True)
+    repo.persist_entities(commit, entities_to_create)
+    conn.commit()
+    
+    # Load entities - this should use 2 queries, not 101
+    entities, _ = _load_entities(conn, "master")
+    
+    assert len(entities) == 100
+    
+    # Verify member names are loaded correctly for all
+    for i in range(100):
+        entity = entities[f"class-{i}"]
+        assert len(entity["member_names"]) == 5
+        assert f"method0" in entity["member_names"]
+    
+    conn.close()
 
