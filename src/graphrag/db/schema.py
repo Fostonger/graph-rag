@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def apply_schema(conn: sqlite3.Connection) -> None:
@@ -192,6 +192,45 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_relationships_target
             ON entity_relationships(target_entity_id, edge_type);
+        """
+    )
+
+    # Performance indexes for graph queries (added in schema v2)
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_versions_lookup
+            ON entity_versions(entity_id, commit_id DESC);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_versions_not_deleted
+            ON entity_versions(is_deleted, entity_id, commit_id DESC)
+            WHERE is_deleted = 0;
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationships_composite
+            ON entity_relationships(
+                source_entity_id,
+                target_entity_id,
+                target_name,
+                edge_type,
+                commit_id DESC
+            );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_members_entity
+            ON members(entity_id);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_relationships_commit
+            ON entity_relationships(commit_id, is_deleted);
         """
     )
 
