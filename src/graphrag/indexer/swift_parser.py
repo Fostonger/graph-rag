@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Node, Parser
 from tree_sitter_swift import language as swift_language
 
 from ..models.records import EntityRecord, MemberRecord, ParsedSource, RelationshipRecord
@@ -38,10 +39,95 @@ PROPERTY_DECL_RE = re.compile(
     r"(?:var|let)\s+(?P<name>[A-Za-z_]\w*)\s*:\s*(?P<type>[A-Za-z_][\w?.<>, ]*)"
 )
 
-CALL_EXPR_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<type>[A-Z][A-Za-z0-9_]*)\s*\(",
-    re.MULTILINE,
-)
+@dataclass(slots=True)
+class TypeMetadata:
+    simple_name: str
+    display_name: str
+    kind: Optional[str] = None
+    declarations: List[str] = field(default_factory=list)
+    extensions: List[str] = field(default_factory=list)
+    members: Dict[str, List[MemberRecord]] = field(default_factory=dict)
+    conforms_to: Dict[str, str] = field(default_factory=dict)
+    superclasses: Dict[str, str] = field(default_factory=dict)
+    references: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def add_members(self, source_id: str, members: Iterable[MemberRecord]) -> None:
+        members = list(members)
+        if not members:
+            return
+        bucket = self.members.setdefault(source_id, [])
+        bucket.extend(members)
+
+
+class TypeRegistry:
+    def __init__(self, simplify: Callable[[str], str]) -> None:
+        self._simplify = simplify
+        self._types: Dict[str, TypeMetadata] = {}
+
+    def _key(self, name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        simplified = self._simplify(name)
+        return simplified or None
+
+    def _ensure(self, name: Optional[str]) -> Optional[TypeMetadata]:
+        key = self._key(name)
+        if not key:
+            return None
+        metadata = self._types.get(key)
+        if not metadata:
+            display = name or key
+            metadata = TypeMetadata(simple_name=key, display_name=display)
+            self._types[key] = metadata
+        return metadata
+
+    def register_entity(self, record: EntityRecord) -> None:
+        target_name = record.extended_type if record.kind == "extension" else record.name
+        metadata = self._ensure(target_name)
+        if not metadata:
+            return
+        if record.kind != "extension":
+            if metadata.kind in (None, record.kind):
+                metadata.kind = record.kind
+            if record.stable_id not in metadata.declarations:
+                metadata.declarations.append(record.stable_id)
+        else:
+            if record.stable_id not in metadata.extensions:
+                metadata.extensions.append(record.stable_id)
+        metadata.add_members(record.stable_id, record.members)
+
+    def note_conformance(self, type_name: str, protocol_name: str) -> None:
+        owner = self._ensure(type_name)
+        proto_key = self._key(protocol_name)
+        if not owner or not proto_key:
+            return
+        owner.conforms_to.setdefault(proto_key, protocol_name)
+        self._ensure(protocol_name)
+
+    def note_superclass(self, type_name: str, superclass_name: str) -> None:
+        owner = self._ensure(type_name)
+        superclass_key = self._key(superclass_name)
+        if not owner or not superclass_key:
+            return
+        owner.superclasses.setdefault(superclass_key, superclass_name)
+        self._ensure(superclass_name)
+
+    def note_reference(self, type_name: str, source_id: str, context: str) -> None:
+        metadata = self._ensure(type_name)
+        if not metadata:
+            return
+        refs = metadata.references.setdefault(context, set())
+        refs.add(source_id)
+
+    def ensure_type(self, type_name: str) -> None:
+        self._ensure(type_name)
+
+    def get_kind(self, name: str) -> Optional[str]:
+        key = self._key(name)
+        if not key:
+            return None
+        metadata = self._types.get(key)
+        return metadata.kind if metadata else None
 
 
 class SwiftParser(ParserAdapter):
@@ -54,8 +140,9 @@ class SwiftParser(ParserAdapter):
     ) -> None:
         self._language = Language(swift_language())
         self._parser = Parser(self._language)
+        self._expr_parser = Parser(self._language)
         self._module_resolver = ModuleResolver(project_root, dependencies)
-        self._known_entities: Dict[str, str] = {}
+        self._type_registry = TypeRegistry(self._simplify_type_name)
 
     def parse(self, source: str, path: Path) -> ParsedSource:
         tree = self._parser.parse(source.encode("utf-8"))
@@ -118,10 +205,7 @@ class SwiftParser(ParserAdapter):
 
     def _register_entities(self, entities: List[EntityRecord]) -> None:
         for record in entities:
-            if record.kind == "extension":
-                continue
-            key = self._simplify_type_name(record.name)
-            self._known_entities[key] = record.kind
+            self._type_registry.register_entity(record)
 
     def _iter_nodes(self, node):
         stack = [node]
@@ -139,6 +223,11 @@ class SwiftParser(ParserAdapter):
             if child.type in {"identifier", "type_identifier", "simple_identifier"}:
                 return source_bytes[child.start_byte : child.end_byte].decode("utf-8")
         return None
+
+    def _entity_type_name(self, record: EntityRecord) -> Optional[str]:
+        if record.kind == "extension" and record.extended_type:
+            return record.extended_type
+        return record.name
 
     def _extract_members(
         self,
@@ -202,6 +291,9 @@ class SwiftParser(ParserAdapter):
                 continue
             is_weak = bool(match.group("prefix"))
             edge_type = "weakReference" if is_weak else "strongReference"
+            self._type_registry.note_reference(
+                target_type, record.stable_id, "property"
+            )
             metadata = {
                 "member": member.name,
                 "storage": "property",
@@ -228,6 +320,9 @@ class SwiftParser(ParserAdapter):
                 continue
             created = self._find_created_types(member.code)
             for type_name in created:
+                self._type_registry.note_reference(
+                    type_name, record.stable_id, "instantiation"
+                )
                 rels.append(
                     RelationshipRecord(
                         source_stable_id=record.stable_id,
@@ -241,17 +336,49 @@ class SwiftParser(ParserAdapter):
 
     def _find_created_types(self, code: str) -> Set[str]:
         types: Set[str] = set()
-        for match in CALL_EXPR_RE.finditer(code):
-            type_name = match.group("type")
-            if type_name and type_name[0].isupper():
-                types.add(self._simplify_type_name(type_name))
+        snippet = code.strip()
+        if not snippet:
+            return types
+        source_bytes = snippet.encode("utf-8")
+        tree = self._expr_parser.parse(source_bytes)
+        for node in self._iter_nodes(tree.root_node):
+            if node.type != "call_expression":
+                continue
+            target_name = self._call_target_name(node, source_bytes)
+            if target_name and target_name[0].isupper():
+                types.add(self._simplify_type_name(target_name))
         return types
+
+    def _call_target_name(self, node: Node, source_bytes: bytes) -> Optional[str]:
+        head = None
+        for child in node.children:
+            if child.type == "call_suffix":
+                break
+            if child.is_named:
+                head = child
+                break
+        if head is None:
+            return None
+        if head.type in {"simple_identifier", "identifier", "type_identifier"}:
+            return source_bytes[head.start_byte : head.end_byte].decode("utf-8")
+        if head.type == "navigation_expression":
+            if any(child.type == "call_expression" for child in head.children):
+                return None
+            text = source_bytes[head.start_byte : head.end_byte].decode("utf-8")
+            segments = [segment for segment in text.split(".") if segment]
+            while segments:
+                candidate = segments.pop()
+                if candidate and candidate[0].isupper():
+                    return candidate
+            return None
+        return None
 
     def _relationships_from_inheritance(
         self, record: EntityRecord
     ) -> List[RelationshipRecord]:
         if record.kind not in {"class", "struct", "enum", "extension"}:
             return []
+        type_name = self._entity_type_name(record)
         inherited = self._parse_inherited_types(record.signature)
         if not inherited:
             return []
@@ -267,6 +394,8 @@ class SwiftParser(ParserAdapter):
                 metadata: Dict[str, str] = {}
                 if assumed_superclass:
                     metadata["assumed"] = "true"
+                if type_name:
+                    self._type_registry.note_superclass(type_name, superclass)
                 rels.append(
                     RelationshipRecord(
                         source_stable_id=record.stable_id,
@@ -281,6 +410,8 @@ class SwiftParser(ParserAdapter):
             metadata = {}
             if record.kind == "extension":
                 metadata = {"declaredVia": "extension"}
+            if type_name:
+                self._type_registry.note_conformance(type_name, proto)
             rels.append(
                 RelationshipRecord(
                     source_stable_id=record.stable_id,
@@ -359,23 +490,12 @@ class SwiftParser(ParserAdapter):
 
     def _classify_inherited_type(self, type_name: str) -> Optional[str]:
         simplified = self._simplify_type_name(type_name)
-        kind = self._known_entities.get(simplified)
+        kind = self._type_registry.get_kind(simplified)
         if kind:
             return kind
-        if self._looks_like_protocol(simplified):
-            return "protocol"
         if simplified in {"AnyObject", "Sendable"}:
             return "protocol"
         return None
-
-    def _looks_like_protocol(self, name: str) -> bool:
-        if name.startswith("I") and len(name) > 1 and name[1].isupper():
-            return True
-        if name.endswith("Protocol") or name.endswith("Delegate") or name.endswith(
-            "DataSource"
-        ):
-            return True
-        return False
 
     def _simplify_type_name(self, name: str) -> str:
         simple = name.split("<", 1)[0]

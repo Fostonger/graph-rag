@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from ..config import Settings
+from .project_parsers import ProjectMetadata, SwiftGekoProjectParser, TestTargetMetadata
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,8 @@ class TargetInfo:
     name: str
     target_type: str
     source_roots: List[Path]
+    sources: List[str] = field(default_factory=list)
+    tests: List[TestTargetMetadata] = field(default_factory=list)
 
 
 class DependenciesWorker:
@@ -24,16 +26,11 @@ class DependenciesWorker:
 
 
 class TuistDependenciesWorker(DependenciesWorker):
-    TARGET_RE = re.compile(
-        r"Target\s*\(\s*name\s*:\s*\"(?P<name>[^\"]+)\"(?P<body>.*?)\)",
-        re.DOTALL,
-    )
-    PRODUCT_RE = re.compile(r"product\s*:\s*\.(?P<product>[A-Za-z0-9_]+)")
-    SOURCES_RE = re.compile(r"sources\s*:\s*\[(?P<sources>.*?)\]", re.DOTALL)
-    STRING_RE = re.compile(r"\"([^\"]+)\"")
 
     def __init__(self, project_root: Path) -> None:
         super().__init__(project_root)
+        self._parser = SwiftGekoProjectParser()
+        self._project_cache: dict[Path, Optional[ProjectMetadata]] = {}
         self._targets: List[TargetInfo] = self._load_targets()
 
     def target_for_file(self, relative_path: Path) -> Optional[TargetInfo]:
@@ -69,42 +66,39 @@ class TuistDependenciesWorker(DependenciesWorker):
     def _load_targets(self) -> List[TargetInfo]:
         targets: List[TargetInfo] = []
         for project_file in self._project_files():
-            try:
-                text = project_file.read_text(encoding="utf-8")
-            except OSError:
+            metadata = self._project_metadata(project_file)
+            if metadata is None:
                 continue
-            for match in self.TARGET_RE.finditer(text):
-                name = match.group("name").strip()
-                body = match.group("body")
-                product = self._extract_product(body)
-                target_type = self._classify_target(product)
-                sources = self._extract_sources(body)
-                if not sources:
-                    sources = self._default_sources(project_file.parent, name)
+            for target in metadata.targets:
+                sources = target.sources or self._default_sources(project_file.parent, target.name)
+                source_roots = [
+                    self._normalize_source(project_file.parent, src) for src in sources
+                ]
                 targets.append(
                     TargetInfo(
-                        name=name,
-                        target_type=target_type,
-                        source_roots=[self._normalize_source(project_file.parent, src) for src in sources],
+                        name=target.name,
+                        target_type=target.target_type,
+                        source_roots=source_roots,
+                        sources=sources,
+                        tests=target.tests,
                     )
                 )
         return targets
+
+    def _project_metadata(self, project_file: Path) -> Optional[ProjectMetadata]:
+        if project_file in self._project_cache:
+            return self._project_cache[project_file]
+        try:
+            metadata = self._parser.parse(project_file)
+        except ValueError:
+            metadata = None
+        self._project_cache[project_file] = metadata
+        return metadata
 
     def _project_files(self) -> Iterable[Path]:
         if not self.project_root.exists():
             return []
         return self.project_root.rglob("Project.swift")
-
-    def _extract_product(self, body: str) -> str:
-        match = self.PRODUCT_RE.search(body)
-        return match.group("product") if match else "app"
-
-    def _extract_sources(self, body: str) -> List[str]:
-        match = self.SOURCES_RE.search(body)
-        if not match:
-            return []
-        payload = match.group("sources")
-        return [entry for entry in self.STRING_RE.findall(payload)]
 
     def _default_sources(self, project_dir: Path, target_name: str) -> List[str]:
         default = project_dir / "Targets" / target_name / "Sources"
@@ -121,12 +115,6 @@ class TuistDependenciesWorker(DependenciesWorker):
         except ValueError:
             relative = absolute
         return relative
-
-    def _classify_target(self, product: str) -> str:
-        lowered = product.lower()
-        if "test" in lowered:
-            return "test"
-        return "app"
 
 
 class GekoDependenciesWorker(TuistDependenciesWorker):

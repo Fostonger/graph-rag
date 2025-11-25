@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Optional
 
 from .dependencies import DependenciesWorker
+from .project_parsers import ProjectMetadata, SwiftGekoProjectParser, TargetMetadata
 
 
 @dataclass(frozen=True)
@@ -21,9 +21,10 @@ class ModuleResolver:
         dependencies: Optional[DependenciesWorker] = None,
     ) -> None:
         self.project_root = project_root
-        self._dir_cache: dict[Path, str] = {}
-        self._project_cache: dict[Path, Optional[str]] = {}
+        self._dir_cache: dict[Path, ModuleMetadata] = {}
+        self._project_cache: dict[Path, Optional[ProjectMetadata]] = {}
         self._dependencies = dependencies
+        self._project_parser: Optional[SwiftGekoProjectParser] = None
 
     def resolve(self, relative_path: Path) -> str:
         return self.resolve_metadata(relative_path).module
@@ -39,36 +40,81 @@ class ModuleResolver:
         current = abs_path.parent
         while current and current != current.parent:
             if current in self._dir_cache:
-                module_name = self._dir_cache[current]
-                return ModuleMetadata(module=module_name)
+                return self._dir_cache[current]
             project_file = current / "Project.swift"
             if project_file.exists():
-                module_name = self._module_name_from_project(project_file)
-                if module_name:
-                    self._dir_cache[current] = module_name
-                    return ModuleMetadata(module=module_name)
+                metadata = self._project_metadata(project_file)
+                if metadata:
+                    target = self._match_target(metadata, project_file.parent, abs_path)
+                    if target:
+                        module_meta = ModuleMetadata(
+                            module=target.name,
+                            target_type=target.target_type,
+                        )
+                    elif metadata.targets:
+                        first = metadata.targets[0]
+                        module_meta = ModuleMetadata(
+                            module=first.name, target_type=first.target_type
+                        )
+                    else:
+                        module_meta = ModuleMetadata(module=metadata.name)
+                    self._dir_cache[current] = module_meta
+                    return module_meta
             current = current.parent
         return ModuleMetadata(self._fallback(relative_path))
 
-    def _module_name_from_project(self, path: Path) -> Optional[str]:
+    def _project_metadata(self, path: Path) -> Optional[ProjectMetadata]:
         if path in self._project_cache:
-            cached = self._project_cache[path]
-            if cached:
-                return cached
+            return self._project_cache[path]
+        parser = self._ensure_project_parser()
         try:
-            text = path.read_text(encoding="utf-8")
+            metadata = parser.parse(path)
+        except ValueError:
+            metadata = None
+        self._project_cache[path] = metadata
+        return metadata
+
+    def _ensure_project_parser(self) -> SwiftGekoProjectParser:
+        if self._project_parser is None:
+            self._project_parser = SwiftGekoProjectParser()
+        return self._project_parser
+
+    def _match_target(
+        self, metadata: ProjectMetadata, project_dir: Path, file_path: Path
+    ) -> Optional[TargetMetadata]:
+        for target in metadata.targets:
+            for pattern in target.sources:
+                root = self._source_root_from_pattern(project_dir, pattern)
+                if root and self._path_is_within(file_path, root):
+                    return target
+        return None
+
+    def _source_root_from_pattern(self, project_dir: Path, pattern: str) -> Optional[Path]:
+        cleaned = pattern.strip().replace("\\", "/")
+        if not cleaned:
+            return project_dir.resolve()
+        cut = len(cleaned)
+        for token in ("{", "*"):
+            idx = cleaned.find(token)
+            if idx != -1 and idx < cut:
+                cut = idx
+        cleaned = cleaned[:cut].rstrip("/")
+        candidate = Path(cleaned)
+        if candidate.is_absolute():
+            base = candidate
+        else:
+            base = (project_dir / cleaned) if cleaned else project_dir
+        try:
+            return base.resolve()
         except OSError:
-            self._project_cache[path] = None
-            return None
-        match = re.search(r'Project\s*\(.*?name\s*:\s*"([^"]+)"', text, re.DOTALL)
-        module_name: Optional[str] = None
-        if match:
-            module_name = match.group(1)
-        if not module_name:
-            fallback = re.search(r'name\s*:\s*"([^"]+)"', text)
-            module_name = fallback.group(1) if fallback else None
-        self._project_cache[path] = module_name
-        return module_name
+            return base
+
+    def _path_is_within(self, candidate: Path, root: Path) -> bool:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            return False
 
     def _fallback(self, path: Path) -> str:
         parts = list(path.parts)
