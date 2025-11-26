@@ -646,16 +646,26 @@ class MetadataRepository:
         self.conn.execute("DELETE FROM extension_latest;")
         
         # Rebuild entity_latest from versioned data
+        # Note: We first find the latest commit per entity, then pick a single version_id
+        # for that commit to avoid duplicates when same entity appears in multiple files
         self.conn.execute(
             """
             INSERT INTO entity_latest (
                 stable_id, entity_id, name, kind, module, file_path,
                 signature, properties, member_names, target_type, visibility, commit_hash
             )
-            WITH latest AS (
+            WITH latest_commit AS (
                 SELECT entity_id, MAX(commit_id) AS commit_id
                 FROM entity_versions
                 GROUP BY entity_id
+            ),
+            latest_version AS (
+                SELECT lc.entity_id, lc.commit_id, MAX(ev.id) AS version_id
+                FROM latest_commit lc
+                JOIN entity_versions ev
+                    ON ev.entity_id = lc.entity_id
+                   AND ev.commit_id = lc.commit_id
+                GROUP BY lc.entity_id, lc.commit_id
             ),
             member_agg AS (
                 SELECT entity_id, GROUP_CONCAT(name, '|') AS names
@@ -675,11 +685,9 @@ class MetadataRepository:
                 json_extract(ev.properties, '$.target_type'),
                 json_extract(ev.properties, '$.visibility'),
                 c.hash
-            FROM latest
-            JOIN entity_versions ev
-                ON ev.entity_id = latest.entity_id
-               AND ev.commit_id = latest.commit_id
-            JOIN entities e ON e.id = latest.entity_id
+            FROM latest_version lv
+            JOIN entity_versions ev ON ev.id = lv.version_id
+            JOIN entities e ON e.id = lv.entity_id
             LEFT JOIN files f ON f.id = ev.file_id
             LEFT JOIN member_agg ma ON ma.entity_id = e.id
             JOIN commits c ON c.id = ev.commit_id
