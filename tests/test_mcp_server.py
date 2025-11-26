@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from git import Repo
 
 from graphrag.config import Settings
 from graphrag.db import schema
@@ -212,6 +213,266 @@ def test_mcp_get_graph_tool(tmp_path):
         node_names = {node["name"] for node in graph["nodes"]}
         assert "MyModuleAssembly" not in node_names
         assert "MyModuleViewController" in node_names
+    finally:
+        mcp_server.runtime_settings = original
+
+
+# --- Branch switching tests ---
+
+
+def _init_git_repo(path: Path) -> Repo:
+    """Initialize a git repository with master branch."""
+    repo = Repo.init(path, initial_branch="master")
+    repo.git.config("user.email", "test@example.com")
+    repo.git.config("user.name", "GraphRag Tests")
+    sources = path / "Sources"
+    sources.mkdir(exist_ok=True)
+    file_path = sources / "Dummy.swift"
+    file_path.write_text("struct Dummy {}\n")
+    repo.index.add([str(file_path.relative_to(path))])
+    repo.index.commit("init master")
+    return repo
+
+
+def _seed_master_db_with_rebuild(db_path: Path, entities: list[EntityRecord]) -> None:
+    """Seed master DB and rebuild materialized views."""
+    conn = connect(db_path)
+    schema.apply_schema(conn)
+    repo = MetadataRepository(conn)
+    commit_id = repo.record_commit("master-hash", None, "master", True)
+    repo.persist_entities(commit_id, entities)
+    repo.rebuild_latest_tables()
+    conn.commit()
+    conn.close()
+
+
+def _seed_feature_db_with_branch(
+    db_path: Path, branch: str, entities: list[EntityRecord]
+) -> None:
+    """Seed feature DB for a specific branch and rebuild views."""
+    conn = connect(db_path)
+    schema.apply_schema(conn)
+    repo = MetadataRepository(conn)
+    repo.set_schema_value("feature_branch", branch)
+    commit_id = repo.record_commit("feature-hash", None, branch, False)
+    repo.persist_entities(commit_id, entities)
+    repo.rebuild_latest_tables()
+    conn.commit()
+    conn.close()
+
+
+def test_mcp_get_graph_ignores_feature_db_on_default_branch(tmp_path):
+    """
+    MCP get_graph should use only master DB when on default branch,
+    even if a feature DB exists with different data.
+    """
+    repo = _init_git_repo(tmp_path)
+    assert repo.active_branch.name == "master"
+
+    db_path = tmp_path / "master.db"
+    feature_db_path = tmp_path / "feature.db"
+
+    # Seed master DB with MasterEntity
+    master_entity = EntityRecord(
+        name="MasterEntity",
+        kind="class",
+        module="App",
+        language="swift",
+        file_path=Path("Sources/Master.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class MasterEntity",
+        code="class MasterEntity {}",
+        stable_id="master-entity",
+        target_type="app",
+        members=[],
+    )
+    _seed_master_db_with_rebuild(db_path, [master_entity])
+
+    # Seed feature DB (for a different branch) with FeatureEntity
+    feature_entity = EntityRecord(
+        name="FeatureEntity",
+        kind="class",
+        module="Feature",
+        language="swift",
+        file_path=Path("Sources/Feature.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class FeatureEntity",
+        code="class FeatureEntity {}",
+        stable_id="feature-entity",
+        target_type="app",
+        members=[],
+    )
+    _seed_feature_db_with_branch(feature_db_path, "feature/foo", [feature_entity])
+
+    settings = Settings(
+        repo_path=tmp_path,
+        db_path=db_path,
+        feature_db_path=feature_db_path,
+        default_branch="master",
+    )
+    original = mcp_server.runtime_settings
+    mcp_server.runtime_settings = settings
+    try:
+        # Should find MasterEntity from master DB
+        response = asyncio.run(
+            mcp_server.handle_call_tool("get_graph", {"entity": "MasterEntity"})
+        )
+        payload = json.loads(response[0].text)
+        assert payload["graph"]["entity"]["name"] == "MasterEntity"
+
+        # Should NOT find FeatureEntity (feature DB ignored on default branch)
+        with pytest.raises(ValueError, match="was not found"):
+            asyncio.run(
+                mcp_server.handle_call_tool("get_graph", {"entity": "FeatureEntity"})
+            )
+    finally:
+        mcp_server.runtime_settings = original
+
+
+def test_mcp_get_graph_ignores_stale_feature_db_after_branch_switch(tmp_path):
+    """
+    Reproduce the original bug: after switching from feature branch to main,
+    get_graph should work correctly using only master DB.
+    """
+    repo = _init_git_repo(tmp_path)
+
+    db_path = tmp_path / "master.db"
+    feature_db_path = tmp_path / "feature.db"
+
+    # Seed master DB
+    master_entity = EntityRecord(
+        name="AppController",
+        kind="class",
+        module="App",
+        language="swift",
+        file_path=Path("Sources/AppController.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class AppController",
+        code="class AppController {}",
+        stable_id="app-controller",
+        target_type="app",
+        members=[],
+    )
+    _seed_master_db_with_rebuild(db_path, [master_entity])
+
+    # Simulate: user was on feature branch and indexed feature DB
+    repo.git.checkout("-b", "feature/new-feature")
+    feature_entity = EntityRecord(
+        name="NewFeatureController",
+        kind="class",
+        module="Feature",
+        language="swift",
+        file_path=Path("Sources/NewFeature.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class NewFeatureController",
+        code="class NewFeatureController {}",
+        stable_id="new-feature",
+        target_type="app",
+        members=[],
+    )
+    _seed_feature_db_with_branch(feature_db_path, "feature/new-feature", [feature_entity])
+
+    # Switch back to master (simulating user switching branches)
+    repo.git.checkout("master")
+    assert repo.active_branch.name == "master"
+
+    settings = Settings(
+        repo_path=tmp_path,
+        db_path=db_path,
+        feature_db_path=feature_db_path,
+        default_branch="master",
+    )
+    original = mcp_server.runtime_settings
+    mcp_server.runtime_settings = settings
+    try:
+        # This was failing before the fix - feature DB was corrupting queries
+        response = asyncio.run(
+            mcp_server.handle_call_tool("get_graph", {"entity": "AppController"})
+        )
+        payload = json.loads(response[0].text)
+        assert payload["graph"]["entity"]["name"] == "AppController"
+
+        # Feature entity should NOT be accessible from master
+        with pytest.raises(ValueError, match="was not found"):
+            asyncio.run(
+                mcp_server.handle_call_tool(
+                    "get_graph", {"entity": "NewFeatureController"}
+                )
+            )
+    finally:
+        mcp_server.runtime_settings = original
+
+
+def test_mcp_get_graph_uses_feature_db_when_branch_matches(tmp_path):
+    """
+    When on the correct feature branch, get_graph should use feature DB overlay.
+    """
+    repo = _init_git_repo(tmp_path)
+    repo.git.checkout("-b", "feature/active")
+    assert repo.active_branch.name == "feature/active"
+
+    db_path = tmp_path / "master.db"
+    feature_db_path = tmp_path / "feature.db"
+
+    # Seed master DB
+    master_entity = EntityRecord(
+        name="BaseEntity",
+        kind="class",
+        module="App",
+        language="swift",
+        file_path=Path("Sources/Base.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class BaseEntity",
+        code="class BaseEntity {}",
+        stable_id="base-entity",
+        target_type="app",
+        members=[],
+    )
+    _seed_master_db_with_rebuild(db_path, [master_entity])
+
+    # Seed feature DB for the current branch
+    feature_entity = EntityRecord(
+        name="ActiveFeature",
+        kind="class",
+        module="Feature",
+        language="swift",
+        file_path=Path("Sources/ActiveFeature.swift"),
+        start_line=1,
+        end_line=5,
+        signature="class ActiveFeature",
+        code="class ActiveFeature {}",
+        stable_id="active-feature",
+        target_type="app",
+        members=[],
+    )
+    _seed_feature_db_with_branch(feature_db_path, "feature/active", [feature_entity])
+
+    settings = Settings(
+        repo_path=tmp_path,
+        db_path=db_path,
+        feature_db_path=feature_db_path,
+        default_branch="master",
+    )
+    original = mcp_server.runtime_settings
+    mcp_server.runtime_settings = settings
+    try:
+        # Should find both master and feature entities
+        base_response = asyncio.run(
+            mcp_server.handle_call_tool("get_graph", {"entity": "BaseEntity"})
+        )
+        base_payload = json.loads(base_response[0].text)
+        assert base_payload["graph"]["entity"]["name"] == "BaseEntity"
+
+        feature_response = asyncio.run(
+            mcp_server.handle_call_tool("get_graph", {"entity": "ActiveFeature"})
+        )
+        feature_payload = json.loads(feature_response[0].text)
+        assert feature_payload["graph"]["entity"]["name"] == "ActiveFeature"
     finally:
         mcp_server.runtime_settings = original
 

@@ -12,9 +12,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from ..config import Settings, load_settings
-from ..db import schema
-from ..db.connection import connect, get_connection
-from ..db.queries import find_entities, get_entity_graph, get_members
+from ..db.query_service import QueryService
 
 server = Server("graphrag-mcp")
 runtime_settings: Optional[Settings] = None
@@ -40,29 +38,11 @@ def _json_text(payload: Any) -> TextContent:
     return TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))
 
 
-def _with_connection(func):
+def _get_query_service() -> QueryService:
+    """Get QueryService instance with current settings."""
     if runtime_settings is None:
         raise RuntimeError("MCP server has not been initialized with settings.")
-    with get_connection(runtime_settings.db_path) as conn:
-        schema.apply_schema(conn)
-        return func(conn)
-
-
-def _with_graph_connections(func):
-    if runtime_settings is None:
-        raise RuntimeError("MCP server has not been initialized with settings.")
-    feature_conn = None
-    with get_connection(runtime_settings.db_path) as master_conn:
-        schema.apply_schema(master_conn)
-        if runtime_settings.feature_db_path:
-            feature_conn = connect(runtime_settings.feature_db_path)
-            schema.apply_schema(feature_conn)
-        try:
-            return func(master_conn, feature_conn)
-        finally:
-            if feature_conn is not None:
-                feature_conn.commit()
-                feature_conn.close()
+    return QueryService(runtime_settings)
 
 
 @server.list_tools()
@@ -167,16 +147,14 @@ async def handle_list_tools() -> list[Tool]:
 async def handle_call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[TextContent]:
+    service = _get_query_service()
+
     if name == "find_entities":
         query = arguments.get("query", "")
         limit = int(arguments.get("limit", 25))
         include_code = bool(arguments.get("include_code", False))
 
-        def _run(conn):
-            rows = find_entities(conn, query, limit=limit, include_code=include_code)
-            return rows
-
-        rows = _with_connection(_run)
+        rows = service.find_entities(query, limit=limit, include_code=include_code)
         return [_json_text({"tool": name, "count": len(rows), "entities": rows})]
 
     if name == "get_members":
@@ -187,16 +165,11 @@ async def handle_call_tool(
         if not entities:
             raise ValueError("entities array cannot be empty")
 
-        def _run(conn):
-            rows = get_members(
-                conn,
-                entity_names=entities,
-                member_filters=members,
-                include_code=include_code,
-            )
-            return rows
-
-        rows = _with_connection(_run)
+        rows = service.get_members(
+            entity_names=entities,
+            member_filters=members,
+            include_code=include_code,
+        )
         return [_json_text({"tool": name, "count": len(rows), "members": rows})]
 
     if name == "get_graph":
@@ -213,19 +186,14 @@ async def handle_call_tool(
             max_hops = int(max_hops_arg)
         target_type = (arguments.get("targetType") or "app").lower()
 
-        def _run(master_conn, feature_conn):
-            return get_entity_graph(
-                master_conn,
-                feature_conn,
-                entity_name=entity,
-                stop_name=stop_at,
-                direction=direction,
-                include_sibling_subgraphs=include_siblings,
-                max_hops=max_hops,
-                target_type=target_type,
-            )
-
-        payload = _with_graph_connections(_run)
+        payload = service.get_graph(
+            entity_name=entity,
+            stop_name=stop_at,
+            direction=direction,
+            include_sibling_subgraphs=include_siblings,
+            max_hops=max_hops,
+            target_type=target_type,
+        )
         return [_json_text({"tool": name, "graph": payload})]
 
     raise ValueError(f"Unknown tool: {name}")
