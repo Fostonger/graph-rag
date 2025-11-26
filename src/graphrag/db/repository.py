@@ -506,9 +506,15 @@ class MetadataRepository:
             source_ids.add(source_id)
             target_key = (rel.target_name, rel.target_module)
             if target_key not in target_cache:
-                target_cache[target_key] = self._lookup_entity_id(
+                target_id = self._lookup_entity_id(
                     rel.target_name, rel.target_module
                 )
+                # Fallback: if not found with module constraint, try without module
+                # This handles cross-module references where target_module is the
+                # source's module, not the target's actual module
+                if target_id is None and rel.target_module:
+                    target_id = self._lookup_entity_id(rel.target_name, None)
+                target_cache[target_key] = target_id
             target_id = target_cache[target_key]
             resolved.append((source_id, rel, target_id))
 
@@ -634,12 +640,65 @@ class MetadataRepository:
             ),
         )
 
+    def resolve_pending_relationships(self) -> int:
+        """Re-resolve relationships that have NULL target_entity_id.
+        
+        This handles the file ordering issue where relationships are created
+        before their target entities are indexed. After all entities are indexed,
+        this method fills in target_entity_id for any relationships that can
+        now be resolved.
+        
+        Returns:
+            Number of relationships that were updated.
+        """
+        # Find relationships with NULL target_entity_id that might be resolvable
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT target_name, target_module
+            FROM entity_relationships
+            WHERE target_entity_id IS NULL AND is_deleted = 0
+            """
+        ).fetchall()
+        
+        if not rows:
+            return 0
+        
+        updated_count = 0
+        for row in rows:
+            target_name = row["target_name"]
+            target_module = row["target_module"]
+            
+            # Try to find the entity - first with module, then without
+            target_id = self._lookup_entity_id(target_name, target_module)
+            if target_id is None and target_module:
+                target_id = self._lookup_entity_id(target_name, None)
+            
+            if target_id is not None:
+                # Update all matching relationships
+                cursor = self.conn.execute(
+                    """
+                    UPDATE entity_relationships
+                    SET target_entity_id = ?
+                    WHERE target_name = ?
+                      AND (target_module = ? OR (target_module IS NULL AND ? IS NULL))
+                      AND target_entity_id IS NULL
+                      AND is_deleted = 0
+                    """,
+                    (target_id, target_name, target_module, target_module),
+                )
+                updated_count += cursor.rowcount
+        
+        return updated_count
+
     def rebuild_latest_tables(self) -> None:
         """Rebuild the materialized entity_latest, relationship_latest, and extension_latest tables.
         
         This should be called after indexing to update the denormalized views
         that enable fast graph queries without complex joins.
         """
+        # First, resolve any pending relationships that can now be matched
+        self.resolve_pending_relationships()
+        
         # Clear existing data
         self.conn.execute("DELETE FROM entity_latest;")
         self.conn.execute("DELETE FROM relationship_latest;")
