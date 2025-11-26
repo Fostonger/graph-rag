@@ -35,6 +35,11 @@ nosetests.xml
 # Tool caches
 .cache/
 
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
 # Environment files
 .env
 .env.*
