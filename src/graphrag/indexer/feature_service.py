@@ -69,6 +69,7 @@ class FeatureBranchIndexer:
             store.set_schema_value("feature_branch", branch)
             commits_processed = self._index_branch_commits(store, branch)
             worktree_files = self._index_worktree(store, branch)
+            store.rebuild_latest_tables()
 
         return FeatureUpdateResult(
             branch=branch,
@@ -98,6 +99,7 @@ class FeatureBranchIndexer:
                     continue
                 parsed = self._parse_file(content, path_obj)
                 entity_ids = store.persist_entities(commit_id, parsed.entities)
+                store.persist_extensions(commit_id, parsed.extensions, entity_ids)
                 store.persist_relationships(commit_id, entity_ids, parsed.relationships)
             processed.append(commit.hexsha)
         return processed
@@ -127,6 +129,7 @@ class FeatureBranchIndexer:
                 continue
             parsed = self._parse_file(content, path_obj)
             entity_ids = store.persist_entities(commit_id, parsed.entities)
+            store.persist_extensions(commit_id, parsed.extensions, entity_ids)
             store.persist_relationships(commit_id, entity_ids, parsed.relationships)
 
         return sorted(changes.keys())

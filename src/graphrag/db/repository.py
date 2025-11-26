@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from ..models.records import EntityRecord, MemberRecord, RelationshipRecord
+from ..models.records import EntityRecord, ExtensionRecord, MemberRecord, RelationshipRecord
 
 
 @dataclass
@@ -158,6 +158,8 @@ class MetadataRepository:
         }
         if record.target_type:
             props_dict["target_type"] = record.target_type
+        if record.visibility:
+            props_dict["visibility"] = record.visibility
         props = json.dumps(props_dict)
         self.conn.execute(
             """
@@ -226,6 +228,9 @@ class MetadataRepository:
             "DELETE FROM entity_files WHERE file_id = ?",
             (file_id,),
         )
+        
+        # Also mark extensions deleted for this file
+        self.mark_extensions_deleted_for_file(file_path, commit_id)
 
     # --- members ---
     def upsert_member(self, entity_id: int, member: MemberRecord) -> int:
@@ -283,6 +288,156 @@ class MetadataRepository:
                 int(is_deleted),
             ),
         )
+
+    # --- extensions ---
+    def upsert_extension(
+        self, record: ExtensionRecord, entity_id: int
+    ) -> int:
+        """Insert or update an extension record, linked to its parent entity."""
+        row = self.conn.execute(
+            "SELECT id FROM extensions WHERE stable_id = ?",
+            (record.stable_id,),
+        ).fetchone()
+        if row:
+            extension_id = int(row["id"])
+            self.conn.execute(
+                """
+                UPDATE extensions
+                SET entity_id = ?, extended_type = ?, module = ?, language = ?
+                WHERE id = ?
+                """,
+                (
+                    entity_id,
+                    record.extended_type,
+                    record.module,
+                    record.language,
+                    extension_id,
+                ),
+            )
+        else:
+            cur = self.conn.execute(
+                """
+                INSERT INTO extensions (stable_id, entity_id, extended_type, module, language)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.stable_id,
+                    entity_id,
+                    record.extended_type,
+                    record.module,
+                    record.language,
+                ),
+            )
+            extension_id = int(cur.lastrowid)
+        return extension_id
+
+    def record_extension_version(
+        self,
+        extension_id: int,
+        commit_id: int,
+        file_id: int,
+        record: ExtensionRecord,
+        is_deleted: bool = False,
+    ) -> None:
+        """Record a version of an extension at a specific commit."""
+        props_dict = {}
+        if record.target_type:
+            props_dict["target_type"] = record.target_type
+        props = json.dumps(props_dict) if props_dict else None
+        conformances = json.dumps(record.conformances) if record.conformances else None
+        
+        self.conn.execute(
+            """
+            INSERT INTO extension_versions (
+                extension_id, commit_id, file_id, start_line, end_line,
+                signature, code, visibility, constraints, conformances, properties, is_deleted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                extension_id,
+                commit_id,
+                file_id,
+                record.start_line,
+                record.end_line,
+                record.signature,
+                record.code,
+                record.visibility,
+                record.constraints,
+                conformances,
+                props,
+                int(is_deleted),
+            ),
+        )
+
+    def persist_extensions(
+        self,
+        commit_id: int,
+        extensions: Iterable[ExtensionRecord],
+        entity_id_map: Dict[str, int],
+    ) -> Dict[str, int]:
+        """Persist extension records, linking them to their parent entities.
+        
+        Args:
+            commit_id: The commit ID for versioning
+            extensions: Extension records to persist
+            entity_id_map: Map of entity stable_id -> entity_id for linking
+            
+        Returns:
+            Map of extension stable_id -> extension_id
+        """
+        ext_id_map: Dict[str, int] = {}
+        for record in extensions:
+            # Find parent entity by name lookup if not in the current batch
+            parent_entity_id = self._lookup_entity_id(record.extended_type, record.module)
+            if parent_entity_id is None:
+                # Try without module restriction
+                parent_entity_id = self._lookup_entity_id(record.extended_type, None)
+            if parent_entity_id is None:
+                # Skip extensions for types we don't have indexed
+                continue
+                
+            file_id = self.ensure_file(record.file_path, record.language)
+            extension_id = self.upsert_extension(record, parent_entity_id)
+            ext_id_map[record.stable_id] = extension_id
+            self.record_extension_version(extension_id, commit_id, file_id, record)
+            
+            # Also persist extension members linked to the parent entity
+            for member in record.members:
+                member_id = self.upsert_member(parent_entity_id, member)
+                self.record_member_version(member_id, commit_id, file_id, member)
+        
+        return ext_id_map
+
+    def mark_extensions_deleted_for_file(self, file_path: Path, commit_id: int) -> None:
+        """Mark all extensions in a file as deleted."""
+        row = self.conn.execute(
+            "SELECT id FROM files WHERE path = ?",
+            (str(file_path),),
+        ).fetchone()
+        if not row:
+            return
+        file_id = int(row["id"])
+        
+        # Find extensions that have versions in this file
+        extension_rows = self.conn.execute(
+            """
+            SELECT DISTINCT ev.extension_id
+            FROM extension_versions ev
+            WHERE ev.file_id = ?
+            """,
+            (file_id,),
+        ).fetchall()
+        
+        for ext_row in extension_rows:
+            extension_id = int(ext_row["extension_id"])
+            self.conn.execute(
+                """
+                INSERT INTO extension_versions (
+                    extension_id, commit_id, file_id, is_deleted
+                ) VALUES (?, ?, ?, 1)
+                """,
+                (extension_id, commit_id, file_id),
+            )
 
     # --- query helpers ---
     def latest_commit(self) -> Optional[str]:
@@ -480,7 +635,7 @@ class MetadataRepository:
         )
 
     def rebuild_latest_tables(self) -> None:
-        """Rebuild the materialized entity_latest and relationship_latest tables.
+        """Rebuild the materialized entity_latest, relationship_latest, and extension_latest tables.
         
         This should be called after indexing to update the denormalized views
         that enable fast graph queries without complex joins.
@@ -488,13 +643,14 @@ class MetadataRepository:
         # Clear existing data
         self.conn.execute("DELETE FROM entity_latest;")
         self.conn.execute("DELETE FROM relationship_latest;")
+        self.conn.execute("DELETE FROM extension_latest;")
         
         # Rebuild entity_latest from versioned data
         self.conn.execute(
             """
             INSERT INTO entity_latest (
                 stable_id, entity_id, name, kind, module, file_path,
-                signature, properties, member_names, target_type, commit_hash
+                signature, properties, member_names, target_type, visibility, commit_hash
             )
             WITH latest AS (
                 SELECT entity_id, MAX(commit_id) AS commit_id
@@ -517,6 +673,7 @@ class MetadataRepository:
                 ev.properties,
                 COALESCE(ma.names, ''),
                 json_extract(ev.properties, '$.target_type'),
+                json_extract(ev.properties, '$.visibility'),
                 c.hash
             FROM latest
             JOIN entity_versions ev
@@ -590,6 +747,46 @@ class MetadataRepository:
             JOIN entities src ON src.id = lr.source_entity_id
             LEFT JOIN entities tgt ON tgt.id = lr.target_entity_id
             WHERE lr.is_deleted = 0
+            """
+        )
+        
+        # Rebuild extension_latest from versioned data
+        self.conn.execute(
+            """
+            INSERT INTO extension_latest (
+                stable_id, extension_id, entity_id, entity_stable_id,
+                extended_type, module, file_path, signature, visibility,
+                constraints, conformances, member_names, target_type, commit_hash
+            )
+            WITH latest AS (
+                SELECT extension_id, MAX(commit_id) AS commit_id
+                FROM extension_versions
+                GROUP BY extension_id
+            )
+            SELECT
+                ext.stable_id,
+                ext.id,
+                ext.entity_id,
+                e.stable_id,
+                ext.extended_type,
+                ext.module,
+                f.path,
+                ev.signature,
+                ev.visibility,
+                ev.constraints,
+                ev.conformances,
+                '',  -- member_names not tracked separately for extensions
+                json_extract(ev.properties, '$.target_type'),
+                c.hash
+            FROM latest
+            JOIN extension_versions ev
+                ON ev.extension_id = latest.extension_id
+               AND ev.commit_id = latest.commit_id
+            JOIN extensions ext ON ext.id = latest.extension_id
+            JOIN entities e ON e.id = ext.entity_id
+            LEFT JOIN files f ON f.id = ev.file_id
+            JOIN commits c ON c.id = ev.commit_id
+            WHERE ev.is_deleted = 0
             """
         )
 

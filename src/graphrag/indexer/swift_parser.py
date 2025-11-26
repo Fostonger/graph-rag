@@ -8,7 +8,13 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 from tree_sitter import Language, Node, Parser
 from tree_sitter_swift import language as swift_language
 
-from ..models.records import EntityRecord, MemberRecord, ParsedSource, RelationshipRecord
+from ..models.records import (
+    EntityRecord,
+    ExtensionRecord,
+    MemberRecord,
+    ParsedSource,
+    RelationshipRecord,
+)
 from .base import ParserAdapter
 from .dependencies import DependenciesWorker
 from .utils import ModuleResolver, compute_stable_id
@@ -38,6 +44,18 @@ PROPERTY_DECL_RE = re.compile(
     r"(?:(?:private|fileprivate|internal|public)\s+)?"
     r"(?:var|let)\s+(?P<name>[A-Za-z_]\w*)\s*:\s*(?P<type>[A-Za-z_][\w?.<>, ]*)"
 )
+
+# Pattern to extract visibility modifiers from declarations
+VISIBILITY_KEYWORDS = {"public", "open", "internal", "fileprivate", "private"}
+
+
+def _extract_visibility(code: str) -> Optional[str]:
+    """Extract visibility modifier from a declaration."""
+    tokens = code.strip().split()
+    for token in tokens[:5]:  # Check first few tokens
+        if token in VISIBILITY_KEYWORDS:
+            return token
+    return None  # Default is internal in Swift, but we return None for unspecified
 
 @dataclass(slots=True)
 class TypeMetadata:
@@ -96,6 +114,25 @@ class TypeRegistry:
                 metadata.extensions.append(record.stable_id)
         metadata.add_members(record.stable_id, record.members)
 
+    def register_extension(self, record: ExtensionRecord) -> None:
+        """Register an extension and its members with the extended type."""
+        metadata = self._ensure(record.extended_type)
+        if not metadata:
+            return
+        if record.stable_id not in metadata.extensions:
+            metadata.extensions.append(record.stable_id)
+        metadata.add_members(record.stable_id, record.members)
+
+    def get_entity_stable_id(self, type_name: str) -> Optional[str]:
+        """Get the stable_id of the primary declaration for a type."""
+        key = self._key(type_name)
+        if not key:
+            return None
+        metadata = self._types.get(key)
+        if metadata and metadata.declarations:
+            return metadata.declarations[0]
+        return None
+
     def note_conformance(self, type_name: str, protocol_name: str) -> None:
         owner = self._ensure(type_name)
         proto_key = self._key(protocol_name)
@@ -149,8 +186,11 @@ class SwiftParser(ParserAdapter):
         source_bytes = source.encode("utf-8")
         root = tree.root_node
 
-        records: List[EntityRecord] = []
+        entity_records: List[EntityRecord] = []
+        extension_records: List[ExtensionRecord] = []
         relationships: List[RelationshipRecord] = []
+
+        # First pass: collect all entities (not extensions) to build type registry
         for node in self._iter_nodes(root):
             if node.type not in ENTITY_NODE_TYPES:
                 continue
@@ -159,23 +199,19 @@ class SwiftParser(ParserAdapter):
                 continue
 
             code = source_bytes[node.start_byte : node.end_byte].decode("utf-8")
-            extended_type = None
             kind = _derive_kind(code, node.type)
+
+            # Skip extensions in first pass
             if kind == "extension" or node.type == "extension_declaration":
-                extended_type = entity_name
-                kind = "extension"
+                continue
 
             start_line = node.start_point[0] + 1
             end_line = node.end_point[0] + 1
             file_path = path
             module_meta = self._module_resolver.resolve_metadata(file_path)
             module = module_meta.module
-            stable_name = (
-                f"{entity_name}::extension::{path}:{start_line}"
-                if kind == "extension"
-                else entity_name
-            )
-            stable_id = compute_stable_id("swift", module, stable_name)
+            stable_id = compute_stable_id("swift", module, entity_name)
+            visibility = _extract_visibility(code)
 
             members = list(
                 self._extract_members(node, source_bytes, module, entity_name)
@@ -193,15 +229,83 @@ class SwiftParser(ParserAdapter):
                 code=code,
                 stable_id=stable_id,
                 docstring=None,
-                extended_type=extended_type,
+                extended_type=None,
                 target_type=module_meta.target_type,
+                visibility=visibility,
                 members=members,
             )
-            records.append(record)
-        self._register_entities(records)
-        for record in records:
+            entity_records.append(record)
+
+        # Register entities first so we can look up parent stable_ids
+        self._register_entities(entity_records)
+
+        # Second pass: collect extensions and link to parent entities
+        for node in self._iter_nodes(root):
+            if node.type not in ENTITY_NODE_TYPES:
+                continue
+            entity_name = self._extract_name(node, source_bytes)
+            if not entity_name:
+                continue
+
+            code = source_bytes[node.start_byte : node.end_byte].decode("utf-8")
+            kind = _derive_kind(code, node.type)
+
+            # Only process extensions in second pass
+            if kind != "extension" and node.type != "extension_declaration":
+                continue
+
+            extended_type = entity_name
+            start_line = node.start_point[0] + 1
+            end_line = node.end_point[0] + 1
+            file_path = path
+            module_meta = self._module_resolver.resolve_metadata(file_path)
+            module = module_meta.module
+            stable_name = f"{extended_type}::extension::{path}:{start_line}"
+            stable_id = compute_stable_id("swift", module, stable_name)
+            visibility = _extract_visibility(code)
+
+            members = list(
+                self._extract_members(node, source_bytes, module, extended_type)
+            )
+
+            # Extract conformances from extension signature
+            conformances = self._parse_inherited_types(_signature(code))
+
+            # Extract constraints from where clause if present
+            constraints = self._extract_where_clause(code)
+
+            ext_record = ExtensionRecord(
+                stable_id=stable_id,
+                extended_type=extended_type,
+                module=module,
+                language="swift",
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                signature=_signature(code),
+                code=code,
+                constraints=constraints,
+                visibility=visibility,
+                target_type=module_meta.target_type,
+                members=members,
+                conformances=conformances,
+            )
+            extension_records.append(ext_record)
+            self._type_registry.register_extension(ext_record)
+
+        # Derive relationships from entities
+        for record in entity_records:
             relationships.extend(self._derive_relationships(record))
-        return ParsedSource(entities=records, relationships=relationships)
+
+        # Derive relationships from extensions (using parent entity's stable_id)
+        for ext_record in extension_records:
+            relationships.extend(self._derive_extension_relationships(ext_record))
+
+        return ParsedSource(
+            entities=entity_records,
+            extensions=extension_records,
+            relationships=relationships,
+        )
 
     def _register_entities(self, entities: List[EntityRecord]) -> None:
         for record in entities:
@@ -228,6 +332,20 @@ class SwiftParser(ParserAdapter):
         if record.kind == "extension" and record.extended_type:
             return record.extended_type
         return record.name
+
+    def _extract_where_clause(self, code: str) -> Optional[str]:
+        """Extract the where clause from an extension declaration."""
+        # Look for 'where' keyword in the first line (signature)
+        first_line = code.strip().splitlines()[0] if code.strip() else ""
+        where_idx = first_line.find(" where ")
+        if where_idx == -1:
+            return None
+        # Extract from 'where' to the opening brace
+        clause = first_line[where_idx + 7:]  # Skip ' where '
+        brace_idx = clause.find("{")
+        if brace_idx != -1:
+            clause = clause[:brace_idx]
+        return clause.strip() or None
 
     def _extract_members(
         self,
@@ -274,6 +392,86 @@ class SwiftParser(ParserAdapter):
         rels.extend(self._relationships_from_properties(record))
         rels.extend(self._relationships_from_instantiations(record))
         rels.extend(self._relationships_from_inheritance(record))
+        return rels
+
+    def _derive_extension_relationships(
+        self, ext_record: ExtensionRecord
+    ) -> List[RelationshipRecord]:
+        """Derive relationships from an extension.
+        
+        Relationships use the parent entity's stable_id as source (if found),
+        otherwise fall back to the extension's stable_id.
+        """
+        # Try to find the parent entity's stable_id
+        parent_stable_id = self._type_registry.get_entity_stable_id(ext_record.extended_type)
+        source_stable_id = parent_stable_id or ext_record.stable_id
+        
+        rels: List[RelationshipRecord] = []
+        
+        # Relationships from properties declared in extension
+        for member in ext_record.members:
+            if member.kind not in {"variable", "property", "constant"}:
+                continue
+            match = PROPERTY_DECL_RE.search(member.code)
+            if not match:
+                continue
+            target_type = self._normalize_type(match.group("type"))
+            if not target_type or not target_type[0].isupper():
+                continue
+            is_weak = bool(match.group("prefix"))
+            edge_type = "weakReference" if is_weak else "strongReference"
+            self._type_registry.note_reference(
+                target_type, source_stable_id, "property"
+            )
+            metadata = {
+                "member": member.name,
+                "storage": "property",
+                "accessor": member.kind,
+                "strength": "weak" if is_weak else "strong",
+                "declaredVia": "extension",
+            }
+            rels.append(
+                RelationshipRecord(
+                    source_stable_id=source_stable_id,
+                    target_name=target_type,
+                    target_module=ext_record.module,
+                    edge_type=edge_type,
+                    metadata=metadata,
+                )
+            )
+        
+        # Relationships from instantiations in extension methods
+        for member in ext_record.members:
+            if member.kind not in {"function", "initializer"}:
+                continue
+            created = self._find_created_types(member.code)
+            for type_name in created:
+                self._type_registry.note_reference(
+                    type_name, source_stable_id, "instantiation"
+                )
+                rels.append(
+                    RelationshipRecord(
+                        source_stable_id=source_stable_id,
+                        target_name=type_name,
+                        target_module=ext_record.module,
+                        edge_type="creates",
+                        metadata={"member": member.name, "declaredVia": "extension"},
+                    )
+                )
+        
+        # Conformances declared in extension
+        for proto in ext_record.conformances:
+            self._type_registry.note_conformance(ext_record.extended_type, proto)
+            rels.append(
+                RelationshipRecord(
+                    source_stable_id=source_stable_id,
+                    target_name=self._simplify_type_name(proto),
+                    target_module=ext_record.module,
+                    edge_type="conforms",
+                    metadata={"declaredVia": "extension"},
+                )
+            )
+        
         return rels
 
     def _relationships_from_properties(

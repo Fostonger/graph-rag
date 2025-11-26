@@ -47,7 +47,9 @@ class IndexerService:
                     continue
                 parsed = self._parse_file(content, Path(rel_path))
                 entity_ids = store.persist_entities(commit_id, parsed.entities)
+                store.persist_extensions(commit_id, parsed.extensions, entity_ids)
                 store.persist_relationships(commit_id, entity_ids, parsed.relationships)
+            store.rebuild_latest_tables()
         return head.hexsha
 
     def update(self) -> List[str]:
@@ -77,10 +79,12 @@ class IndexerService:
                         continue
                     parsed = self._parse_file(content, path_obj)
                     entity_ids = store.persist_entities(commit_id, parsed.entities)
+                    store.persist_extensions(commit_id, parsed.extensions, entity_ids)
                     store.persist_relationships(
                         commit_id, entity_ids, parsed.relationships
                     )
                 processed.append(commit.hexsha)
+            store.rebuild_latest_tables()
         return processed
 
     # --- helpers ---

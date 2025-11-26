@@ -296,6 +296,7 @@ def _load_entities_fast(conn: sqlite3.Connection, origin: str) -> Dict[str, dict
             properties,
             member_names,
             target_type,
+            visibility,
             commit_hash
         FROM entity_latest
         """
@@ -316,8 +317,70 @@ def _load_entities_fast(conn: sqlite3.Connection, origin: str) -> Dict[str, dict
             "member_names": member_names,
             "origin": origin,
             "target_type": row["target_type"],
+            "visibility": row["visibility"],
+            "extensions": [],  # Will be populated by _load_extensions_fast
         }
+    
+    # Load extensions and attach to entities
+    extensions = _load_extensions_fast(conn, origin)
+    for ext in extensions:
+        entity_stable_id = ext.get("entity_stable_id")
+        if entity_stable_id and entity_stable_id in entities:
+            entities[entity_stable_id]["extensions"].append(ext)
+    
     return entities
+
+
+def _load_extensions_fast(conn: sqlite3.Connection, origin: str) -> List[Dict[str, Any]]:
+    """Load extensions from materialized extension_latest table."""
+    if conn is None:
+        return []
+    
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                stable_id,
+                extension_id,
+                entity_id,
+                entity_stable_id,
+                extended_type,
+                module,
+                file_path,
+                signature,
+                visibility,
+                constraints,
+                conformances,
+                member_names,
+                target_type,
+                commit_hash
+            FROM extension_latest
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist or has old schema - return empty list
+        return []
+    
+    extensions: List[Dict[str, Any]] = []
+    for row in rows:
+        member_names = row["member_names"].split("|") if row["member_names"] else []
+        conformances = json.loads(row["conformances"]) if row["conformances"] else []
+        extensions.append({
+            "stable_id": row["stable_id"],
+            "entity_stable_id": row["entity_stable_id"],
+            "extended_type": row["extended_type"],
+            "module": row["module"],
+            "file_path": row["file_path"],
+            "signature": row["signature"],
+            "visibility": row["visibility"],
+            "constraints": row["constraints"],
+            "conformances": conformances,
+            "member_names": member_names,
+            "target_type": row["target_type"],
+            "commit_hash": row["commit_hash"],
+            "origin": origin,
+        })
+    return extensions
 
 
 def _load_relationships_fast(
@@ -544,6 +607,7 @@ def _load_single_entity_by_name(
             properties,
             member_names,
             target_type,
+            visibility,
             commit_hash
         FROM entity_latest
         WHERE name = ?
@@ -556,9 +620,14 @@ def _load_single_entity_by_name(
         return None
     
     member_names = row["member_names"].split("|") if row["member_names"] else []
+    stable_id = row["stable_id"]
+    
+    # Load extensions for this entity
+    extensions = _load_extensions_for_entity(conn, stable_id, origin)
+    
     return {
         "entity_id": int(row["entity_id"]),
-        "stable_id": row["stable_id"],
+        "stable_id": stable_id,
         "name": row["name"],
         "kind": row["kind"],
         "module": row["module"],
@@ -568,7 +637,57 @@ def _load_single_entity_by_name(
         "member_names": member_names,
         "origin": origin,
         "target_type": row["target_type"],
+        "visibility": row["visibility"],
+        "extensions": extensions,
     }
+
+
+def _load_extensions_for_entity(
+    conn: sqlite3.Connection, entity_stable_id: str, origin: str
+) -> List[Dict[str, Any]]:
+    """Load extensions for a single entity from extension_latest table."""
+    if conn is None:
+        return []
+    
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                stable_id,
+                file_path,
+                signature,
+                visibility,
+                constraints,
+                conformances,
+                member_names,
+                target_type,
+                commit_hash
+            FROM extension_latest
+            WHERE entity_stable_id = ?
+            """,
+            (entity_stable_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist or has old schema - return empty list
+        return []
+    
+    extensions: List[Dict[str, Any]] = []
+    for row in rows:
+        member_names = row["member_names"].split("|") if row["member_names"] else []
+        conformances = json.loads(row["conformances"]) if row["conformances"] else []
+        extensions.append({
+            "stable_id": row["stable_id"],
+            "file_path": row["file_path"],
+            "signature": row["signature"],
+            "visibility": row["visibility"],
+            "constraints": row["constraints"],
+            "conformances": conformances,
+            "member_names": member_names,
+            "target_type": row["target_type"],
+            "commit_hash": row["commit_hash"],
+            "origin": origin,
+        })
+    return extensions
 
 
 def _load_single_entity_by_stable_id(
@@ -592,6 +711,7 @@ def _load_single_entity_by_stable_id(
                 properties,
                 member_names,
                 target_type,
+                visibility,
                 commit_hash
             FROM entity_latest
             WHERE stable_id = ?
@@ -600,6 +720,7 @@ def _load_single_entity_by_stable_id(
         ).fetchone()
         if row:
             member_names = row["member_names"].split("|") if row["member_names"] else []
+            extensions = _load_extensions_for_entity(feature_conn, stable_id, "feature")
             return {
                 "entity_id": int(row["entity_id"]),
                 "stable_id": row["stable_id"],
@@ -612,6 +733,8 @@ def _load_single_entity_by_stable_id(
                 "member_names": member_names,
                 "origin": "feature",
                 "target_type": row["target_type"],
+                "visibility": row["visibility"],
+                "extensions": extensions,
             }
     
     # Fall back to master
@@ -629,6 +752,7 @@ def _load_single_entity_by_stable_id(
                 properties,
                 member_names,
                 target_type,
+                visibility,
                 commit_hash
             FROM entity_latest
             WHERE stable_id = ?
@@ -637,6 +761,7 @@ def _load_single_entity_by_stable_id(
         ).fetchone()
         if row:
             member_names = row["member_names"].split("|") if row["member_names"] else []
+            extensions = _load_extensions_for_entity(master_conn, stable_id, "master")
             return {
                 "entity_id": int(row["entity_id"]),
                 "stable_id": row["stable_id"],
@@ -649,6 +774,8 @@ def _load_single_entity_by_stable_id(
                 "member_names": member_names,
                 "origin": "master",
                 "target_type": row["target_type"],
+                "visibility": row["visibility"],
+                "extensions": extensions,
             }
     
     return None
@@ -832,8 +959,82 @@ def _load_entities(conn: sqlite3.Connection, origin: str) -> Tuple[Dict[str, dic
             "member_names": member_map.get(entity_id, []),
             "origin": origin,
             "target_type": props.get("target_type"),
+            "visibility": props.get("visibility"),
+            "extensions": [],  # Will be populated below
         }
+    
+    # Load extensions and attach to entities
+    extensions = _load_extensions(conn, origin)
+    for ext in extensions:
+        entity_stable_id = ext.get("entity_stable_id")
+        if entity_stable_id and entity_stable_id in entities:
+            entities[entity_stable_id]["extensions"].append(ext)
+    
     return entities, tombstones
+
+
+def _load_extensions(conn: sqlite3.Connection, origin: str) -> List[Dict[str, Any]]:
+    """Load all extensions with their latest version state."""
+    if conn is None:
+        return []
+    
+    try:
+        rows = conn.execute(
+            """
+            WITH latest AS (
+                SELECT extension_id, MAX(commit_id) AS commit_id
+                FROM extension_versions
+                GROUP BY extension_id
+            )
+            SELECT
+                ext.stable_id,
+                ext.entity_id,
+                e.stable_id AS entity_stable_id,
+                ext.extended_type,
+                ext.module,
+                f.path AS file_path,
+                ev.signature,
+                ev.visibility,
+                ev.constraints,
+                ev.conformances,
+                ev.properties,
+                commits.hash AS commit_hash,
+                ev.is_deleted
+            FROM latest
+            JOIN extension_versions ev
+                ON ev.extension_id = latest.extension_id
+               AND ev.commit_id = latest.commit_id
+            JOIN extensions ext ON ext.id = latest.extension_id
+            JOIN entities e ON e.id = ext.entity_id
+            LEFT JOIN files f ON f.id = ev.file_id
+            JOIN commits ON commits.id = ev.commit_id
+            WHERE ev.is_deleted = 0
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist or has old schema - return empty list
+        return []
+    
+    extensions: List[Dict[str, Any]] = []
+    for row in rows:
+        props = json.loads(row["properties"]) if row["properties"] else {}
+        conformances = json.loads(row["conformances"]) if row["conformances"] else []
+        extensions.append({
+            "stable_id": row["stable_id"],
+            "entity_stable_id": row["entity_stable_id"],
+            "extended_type": row["extended_type"],
+            "module": row["module"],
+            "file_path": row["file_path"],
+            "signature": row["signature"],
+            "visibility": row["visibility"],
+            "constraints": row["constraints"],
+            "conformances": conformances,
+            "member_names": [],  # Could be loaded separately if needed
+            "target_type": props.get("target_type"),
+            "commit_hash": row["commit_hash"],
+            "origin": origin,
+        })
+    return extensions
 
 
 def _load_relationships(
@@ -1465,17 +1666,37 @@ def _entity_label(
 
 
 def _serialize_node(node: dict) -> dict:
-    return {
+    result = {
         "name": node["name"],
         "stable_id": node["stable_id"],
         "module": node.get("module"),
         "kind": node.get("kind"),
         "target_type": node.get("target_type"),
+        "visibility": node.get("visibility"),
         "file_path": node.get("file_path"),
         "signature": node.get("signature"),
         "members": node.get("member_names", []),
         "origin": node.get("origin"),
     }
+    
+    # Include extensions if present
+    extensions = node.get("extensions", [])
+    if extensions:
+        result["extensions"] = [
+            {
+                "stable_id": ext.get("stable_id"),
+                "visibility": ext.get("visibility"),
+                "file_path": ext.get("file_path"),
+                "signature": ext.get("signature"),
+                "members": ext.get("member_names", []),
+                "conformances": ext.get("conformances", []),
+                "constraints": ext.get("constraints"),
+                "origin": ext.get("origin"),
+            }
+            for ext in extensions
+        ]
+    
+    return result
 
 
 def _summarize_node(node: dict) -> dict:

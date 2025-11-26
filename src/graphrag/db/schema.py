@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def apply_schema(conn: sqlite3.Connection) -> None:
@@ -137,14 +137,31 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS extensions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_id TEXT UNIQUE NOT NULL,
             entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+            extended_type TEXT NOT NULL,
+            module TEXT,
+            language TEXT NOT NULL DEFAULT 'swift'
+        );
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extension_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            extension_id INTEGER NOT NULL REFERENCES extensions(id) ON DELETE CASCADE,
             commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
             file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
-            extended_type TEXT NOT NULL,
-            constraints TEXT,
             start_line INTEGER,
             end_line INTEGER,
-            code TEXT
+            signature TEXT,
+            code TEXT,
+            visibility TEXT,
+            constraints TEXT,
+            conformances TEXT,
+            properties TEXT,
+            is_deleted INTEGER DEFAULT 0
         );
         """
     )
@@ -249,6 +266,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
             properties TEXT,
             member_names TEXT,
             target_type TEXT,
+            visibility TEXT,
             commit_hash TEXT
         );
         """
@@ -284,6 +302,46 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_relationship_latest_target
             ON relationship_latest(target_stable_id);
+        """
+    )
+
+    # Extension materialized view (added in schema v4)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS extension_latest (
+            stable_id TEXT PRIMARY KEY,
+            extension_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            entity_stable_id TEXT NOT NULL,
+            extended_type TEXT NOT NULL,
+            module TEXT,
+            file_path TEXT,
+            signature TEXT,
+            visibility TEXT,
+            constraints TEXT,
+            conformances TEXT,
+            member_names TEXT,
+            target_type TEXT,
+            commit_hash TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_extensions_entity
+            ON extensions(entity_id);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_extension_versions_extension_commit
+            ON extension_versions(extension_id, commit_id);
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_extension_latest_entity
+            ON extension_latest(entity_stable_id);
         """
     )
 

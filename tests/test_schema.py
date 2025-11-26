@@ -10,7 +10,7 @@ from graphrag.db.schema import SCHEMA_VERSION, apply_schema
 
 def test_schema_version_is_current():
     """Verify schema version is at expected value."""
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
 
 
 def test_apply_schema_creates_all_tables(tmp_path: Path):
@@ -38,9 +38,11 @@ def test_apply_schema_creates_all_tables(tmp_path: Path):
         "member_versions",
         "entity_relationships",
         "extensions",
-        # Materialized views (schema v3)
+        "extension_versions",
+        # Materialized views (schema v3+)
         "entity_latest",
         "relationship_latest",
+        "extension_latest",
     }
     
     assert expected_tables.issubset(table_names)
@@ -81,6 +83,10 @@ def test_apply_schema_creates_all_indexes(tmp_path: Path):
         "idx_entity_latest_name",
         "idx_relationship_latest_source",
         "idx_relationship_latest_target",
+        # Extension indexes (schema v4)
+        "idx_extensions_entity",
+        "idx_extension_versions_extension_commit",
+        "idx_extension_latest_entity",
     }
     
     assert expected_indexes.issubset(index_names), (

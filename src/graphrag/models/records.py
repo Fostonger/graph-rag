@@ -30,7 +30,28 @@ class EntityRecord:
     docstring: Optional[str] = None
     extended_type: Optional[str] = None
     target_type: Optional[str] = None
+    visibility: Optional[str] = None  # public, open, internal, fileprivate, private
     members: List[MemberRecord] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ExtensionRecord:
+    """Record for a Swift extension declaration."""
+    stable_id: str
+    extended_type: str
+    module: str
+    language: str
+    file_path: Path
+    start_line: int
+    end_line: int
+    signature: str
+    code: str
+    constraints: Optional[str] = None
+    visibility: Optional[str] = None  # visibility of extension block
+    target_type: Optional[str] = None
+    members: List[MemberRecord] = field(default_factory=list)
+    conformances: List[str] = field(default_factory=list)  # protocols added via this extension
+
 
 @dataclass(slots=True)
 class RelationshipRecord:
@@ -44,6 +65,7 @@ class RelationshipRecord:
 @dataclass(slots=True)
 class ParsedSource:
     entities: List[EntityRecord] = field(default_factory=list)
+    extensions: List[ExtensionRecord] = field(default_factory=list)
     relationships: List[RelationshipRecord] = field(default_factory=list)
 
 

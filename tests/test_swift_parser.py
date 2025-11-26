@@ -16,7 +16,7 @@ def test_swift_parser_extracts_entities_and_members():
     records = parsed.entities
 
     greeter = next(
-        (r for r in records if r.name == "Greeter" and r.kind != "extension"), None
+        (r for r in records if r.name == "Greeter"), None
     )
     assert greeter is not None
     assert greeter.kind == "struct"
@@ -25,8 +25,9 @@ def test_swift_parser_extracts_entities_and_members():
     member_names = {m.name for m in greeter.members}
     assert member_names == {"name", "greet"}
 
-    extension = next((r for r in records if r.kind == "extension"), None)
-    assert extension is not None
+    # Extensions are now in a separate list
+    assert len(parsed.extensions) == 1
+    extension = parsed.extensions[0]
     assert extension.extended_type == "Greeter"
     assert len(extension.members) == 1
     assert extension.members[0].name == "excitedGreeting"
