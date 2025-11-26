@@ -70,6 +70,25 @@ class TuistDependenciesWorker(DependenciesWorker):
             if metadata is None:
                 continue
             for target in metadata.targets:
+                # First, add entries for test sources (higher priority)
+                for test in target.tests:
+                    if not test.sources:
+                        continue
+                    test_source_roots = [
+                        self._normalize_source(project_file.parent, src)
+                        for src in test.sources
+                    ]
+                    test_name = self._test_target_name(target.name, test.tests_type)
+                    targets.append(
+                        TargetInfo(
+                            name=test_name,
+                            target_type="test",
+                            source_roots=test_source_roots,
+                            sources=test.sources,
+                            tests=[],
+                        )
+                    )
+                # Then add the main target sources
                 sources = target.sources or self._default_sources(project_file.parent, target.name)
                 source_roots = [
                     self._normalize_source(project_file.parent, src) for src in sources
@@ -84,6 +103,11 @@ class TuistDependenciesWorker(DependenciesWorker):
                     )
                 )
         return targets
+
+    def _test_target_name(self, base_name: str, tests_type: str) -> str:
+        """Generate a test target name based on the base target and test type."""
+        type_suffix = tests_type.capitalize() if tests_type else ""
+        return f"{base_name}{type_suffix}Tests"
 
     def _project_metadata(self, project_file: Path) -> Optional[ProjectMetadata]:
         if project_file in self._project_cache:
@@ -106,9 +130,18 @@ class TuistDependenciesWorker(DependenciesWorker):
         return [rel.as_posix()]
 
     def _normalize_source(self, project_dir: Path, source: str) -> Path:
-        cleaned = source.rstrip("/")
-        if cleaned.endswith("**"):
-            cleaned = cleaned[:-2].rstrip("/").rstrip("*")
+        cleaned = source.strip().replace("\\", "/")
+        if not cleaned:
+            return project_dir.resolve()
+        # Cut at first wildcard or brace pattern
+        cut = len(cleaned)
+        for token in ("{", "*"):
+            idx = cleaned.find(token)
+            if idx != -1 and idx < cut:
+                cut = idx
+        cleaned = cleaned[:cut].rstrip("/")
+        if not cleaned:
+            return project_dir.resolve()
         absolute = (project_dir / cleaned).resolve()
         try:
             relative = absolute.relative_to(self.project_root)
