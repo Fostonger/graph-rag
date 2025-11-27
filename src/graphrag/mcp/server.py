@@ -138,7 +138,7 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "stop_at_module_boundary": {
                         "type": "boolean",
-                        "default": False,
+                        "default": True,
                         "description": "If true, entities from different modules become leaf nodes (not traversed further).",
                     },
                 },
@@ -190,7 +190,7 @@ async def handle_call_tool(
         else:
             max_hops = int(max_hops_arg)
         target_type = (arguments.get("targetType") or "app").lower()
-        stop_at_module_boundary = bool(arguments.get("stop_at_module_boundary", False))
+        stop_at_module_boundary = bool(arguments.get("stop_at_module_boundary", True))
 
         payload = service.get_graph(
             entity_name=entity,
