@@ -208,7 +208,8 @@ def test_mcp_get_graph_tool(tmp_path):
         payload = json.loads(response[0].text)
         graph = payload["graph"]
         edge_types = {(edge["source"], edge["target"], edge["type"]) for edge in graph["edges"]}
-        assert ("MyModuleViewController", "MyModuleAssembly", "createdBy") in edge_types
+        # Creates edge shows parent -> child relationship
+        assert ("MyModuleAssembly", "MyModuleViewController", "creates") in edge_types
         assert ("MyModulePresenter", "MyModuleViewController", "weakReference") in edge_types
         node_names = {node["name"] for node in graph["nodes"]}
         assert "MyModuleAssembly" not in node_names

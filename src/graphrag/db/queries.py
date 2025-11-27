@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 LIKE_ESCAPE_CHAR = "\\"
-STRUCTURAL_EDGE_TYPES = {"superclass", "conforms"}
 
 
 def _split_query_terms(raw: str) -> List[str]:
@@ -1381,7 +1380,7 @@ def _build_graph_payload(
                 if child_id and child_id not in visited and child_id != stop_id:
                     queue.append((child_id, depth + 1))
         
-        # UPSTREAM: incoming reference edges + createdBy edges (who created this entity)
+        # UPSTREAM: incoming reference edges + creates edges (who created this entity)
         if direction in {"upstream", "both"}:
             # Incoming reference edges
             for rel in incoming_refs.get(node_id, []):
@@ -1393,25 +1392,19 @@ def _build_graph_payload(
                 if source_id and source_id not in visited and source_id != stop_id:
                     queue.append((source_id, depth + 1))
             
-            # CreatedBy edges (upstream = who created this entity)
+            # Creates edges from upstream perspective (who created this entity)
+            # We use the same "creates" edge type, showing parent -> child
             for rel in creates_by_child.get(node_id, []):
                 parent_id = rel.get("source_stable_id")
-                _append_created_by_edge(
+                _append_creates_edge(
                     rel, entities, edges_payload, edge_keys, nodes_included, stop_id
                 )
                 # Queue parent for traversal (unless it's stop node or already visited)
                 if parent_id and parent_id not in visited and parent_id != stop_id:
                     queue.append((parent_id, depth + 1))
     
-    # Add structural edges (superclass, conforms) for all included nodes
-    _attach_structural_edges(
-        reference_edges,
-        nodes_included,
-        entities,
-        edges_payload,
-        edge_keys,
-        stop_id,
-    )
+    # Note: Structural edges (superclass, conforms) are already included via refs_outgoing/incoming_refs
+    # No need for separate _attach_structural_edges call
 
     # Build node payloads
     visible_nodes = [sid for sid in nodes_included if sid in entities]
@@ -1531,239 +1524,12 @@ def _append_creates_edge(
         _add_node(nodes, child_id, stop_id)
 
 
-def _collect_focus_nodes(
-    start_id: str,
-    stop_id: Optional[str],
-    creates_by_child: Dict[str, List[Dict[str, Any]]],
-) -> set[str]:
-    focus: set[str] = set()
-    queue: deque[str] = deque([start_id])
-    while queue:
-        node_id = queue.popleft()
-        if node_id in focus:
-            continue
-        focus.add(node_id)
-        for rel in creates_by_child.get(node_id, []):
-            parent_id = rel["source_stable_id"]
-            if parent_id and parent_id not in focus:
-                focus.add(parent_id)
-                if not stop_id or parent_id != stop_id:
-                    queue.append(parent_id)
-    return focus
-
-
-def _attach_created_by_edges(
-    display_nodes: set[str],
-    creates_by_child: Dict[str, List[Dict[str, Any]]],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set[Tuple[Any, ...]],
-    nodes_included: set[str],
-    stop_id: Optional[str],
-) -> None:
-    for node_id in display_nodes:
-        for rel in creates_by_child.get(node_id, []):
-            _append_created_by_edge(
-                rel,
-                entities,
-                edges,
-                edge_keys,
-                nodes_included,
-                stop_id,
-            )
-
-
-def _append_reference_edges_limited(
-    refs_outgoing: Dict[str, List[Dict[str, Any]]],
-    incoming_refs: Dict[str, List[Dict[str, Any]]],
-    focus_nodes: set[str],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set[Tuple[Any, ...]],
-    nodes_included: set[str],
-    stop_id: Optional[str],
-    max_hops: Optional[int],
-) -> None:
-    queue: deque[Tuple[str, int]] = deque([(node_id, 0) for node_id in focus_nodes])
-    visited: set[str] = set()
-    while queue:
-        node_id, depth = queue.popleft()
-        if not node_id or node_id in visited:
-            continue
-        visited.add(node_id)
-        if max_hops is not None and depth >= max_hops:
-            continue
-        for rel in refs_outgoing.get(node_id, []):
-            _append_reference_edge(
-                rel,
-                entities,
-                edges,
-                edge_keys,
-                nodes_included,
-                stop_id,
-            )
-        for rel in incoming_refs.get(node_id, []):
-            _append_reference_edge(
-                rel,
-                entities,
-                edges,
-                edge_keys,
-                nodes_included,
-                stop_id,
-            )
-
-
-def _append_reference_edges_full(
-    start_id: str,
-    refs_outgoing: Dict[str, List[Dict[str, Any]]],
-    incoming_refs: Dict[str, List[Dict[str, Any]]],
-    display_nodes: set[str],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set[Tuple[Any, ...]],
-    nodes_included: set[str],
-    stop_id: Optional[str],
-    max_hops: Optional[int],
-) -> None:
-    queue: deque[Tuple[str, int]] = deque([(start_id, 0)])
-    visited: set[str] = set()
-    while queue:
-        node_id, depth = queue.popleft()
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-        if max_hops is not None and depth >= max_hops:
-            continue
-        for rel in refs_outgoing.get(node_id, []):
-            _append_reference_edge(
-                rel,
-                entities,
-                edges,
-                edge_keys,
-                nodes_included,
-                stop_id,
-            )
-            target_id = rel.get("target_stable_id")
-            if target_id and target_id not in visited:
-                display_nodes.add(target_id)
-                queue.append((target_id, depth + 1))
-        for rel in incoming_refs.get(node_id, []):
-            _append_reference_edge(
-                rel,
-                entities,
-                edges,
-                edge_keys,
-                nodes_included,
-                stop_id,
-            )
-            source_id = rel["source_stable_id"]
-            if source_id and source_id not in visited:
-                display_nodes.add(source_id)
-                queue.append((source_id, depth + 1))
-
-
-def _append_reference_edge(
-    rel: Dict[str, Any],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set,
-    nodes: set[str],
-    stop_id: Optional[str],
-) -> None:
-    key = (
-        rel["source_stable_id"],
-        rel.get("target_stable_id"),
-        rel["target_name"],
-        rel["edge_type"],
-    )
-    if key in edge_keys:
-        return
-    edge_keys.add(key)
-    metadata = dict(rel.get("metadata") or {})
-    metadata["origin"] = rel["origin"]
-    edge = {
-        "type": rel["edge_type"],
-        "source": _entity_label(
-            entities, rel["source_stable_id"], rel["source_name"]
-        ),
-        "target": _entity_label(
-            entities,
-            rel.get("target_stable_id"),
-            rel.get("target_entity_name") or rel["target_name"],
-        ),
-        "metadata": metadata,
-    }
-    edges.append(edge)
-    _add_node(nodes, rel["source_stable_id"], stop_id)
-    target_id = rel.get("target_stable_id")
-    if target_id:
-        _add_node(nodes, target_id, stop_id)
-
-
-def _append_created_by_edge(
-    rel: Dict[str, Any],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set,
-    nodes: set[str],
-    stop_id: Optional[str],
-) -> None:
-    child_id = rel.get("target_stable_id")
-    key = (
-        "createdBy",
-        child_id or rel["target_name"],
-        rel["source_stable_id"],
-    )
-    if key in edge_keys:
-        return
-    edge_keys.add(key)
-    metadata = dict(rel.get("metadata") or {})
-    metadata["origin"] = rel["origin"]
-    metadata["creator"] = rel["source_name"]
-    edge = {
-        "type": "createdBy",
-        "source": _entity_label(
-            entities, child_id, rel.get("target_entity_name") or rel["target_name"]
-        ),
-        "target": _entity_label(entities, rel["source_stable_id"], rel["source_name"]),
-        "metadata": metadata,
-    }
-    edges.append(edge)
-    if child_id:
-        _add_node(nodes, child_id, stop_id)
-    _add_node(nodes, rel["source_stable_id"], stop_id)
-
-
 def _add_node(nodes: set[str], stable_id: Optional[str], stop_id: Optional[str]) -> None:
     if not stable_id:
         return
     if stop_id and stable_id == stop_id:
         return
     nodes.add(stable_id)
-
-
-def _attach_structural_edges(
-    reference_edges: List[Dict[str, Any]],
-    included_nodes: set[str],
-    entities: Dict[str, dict],
-    edges: List[dict],
-    edge_keys: set,
-    stop_id: Optional[str],
-) -> None:
-    for rel in reference_edges:
-        if rel["edge_type"] not in STRUCTURAL_EDGE_TYPES:
-            continue
-        source_id = rel["source_stable_id"]
-        if not source_id or source_id not in included_nodes:
-            continue
-        _append_reference_edge(
-            rel,
-            entities,
-            edges,
-            edge_keys,
-            included_nodes,
-            stop_id,
-        )
 
 
 def _entity_label(

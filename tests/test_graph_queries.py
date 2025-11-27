@@ -159,8 +159,9 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
     )
 
     edge_set = {(edge["source"], edge["target"], edge["type"]) for edge in graph["edges"]}
-    assert ("MyModuleViewController", "MyModuleAssembly", "createdBy") in edge_set
-    assert ("MyModulePresenter", "MyModuleAssembly", "createdBy") in edge_set
+    # Creates edges show parent -> child relationship
+    assert ("MyModuleAssembly", "MyModuleViewController", "creates") in edge_set
+    assert ("MyModuleAssembly", "MyModulePresenter", "creates") in edge_set
     assert ("MyModuleViewController", "MyModulePresenter", "strongReference") in edge_set
     # With unified BFS, NetworkWorker is now correctly reachable via Presenter
     assert ("MyModulePresenter", "NetworkWorker", "strongReference") in edge_set
@@ -832,8 +833,8 @@ def test_direction_downstream_shows_creates(tmp_path):
     conn.close()
 
 
-def test_direction_upstream_shows_created_by(tmp_path):
-    """Test that direction=upstream shows who created the entity."""
+def test_direction_upstream_shows_creates(tmp_path):
+    """Test that direction=upstream shows who created the entity (as creates edge)."""
     conn = sqlite3.connect(tmp_path / "dir-upstream.db")
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
@@ -858,7 +859,7 @@ def test_direction_upstream_shows_created_by(tmp_path):
     )
     conn.commit()
 
-    # Starting from Presenter with direction=upstream should show createdBy edge
+    # Starting from Presenter with direction=upstream should show creates edge
     graph = get_entity_graph(
         conn,
         None,
@@ -869,15 +870,15 @@ def test_direction_upstream_shows_created_by(tmp_path):
     edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
     node_names = {node["name"] for node in graph["nodes"]}
     
-    # Should have createdBy edge (Presenter <- Assembly)
-    assert ("Presenter", "Assembly", "createdBy") in edge_set
+    # Should have creates edge (Assembly -> Presenter)
+    assert ("Assembly", "Presenter", "creates") in edge_set
     assert "Presenter" in node_names
     assert "Assembly" in node_names
     conn.close()
 
 
-def test_direction_both_shows_creates_and_created_by(tmp_path):
-    """Test that direction=both shows both creates and createdBy edges."""
+def test_direction_both_shows_creates_in_both_directions(tmp_path):
+    """Test that direction=both shows creates edges in both directions."""
     conn = sqlite3.connect(tmp_path / "dir-both.db")
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
@@ -909,7 +910,7 @@ def test_direction_both_shows_creates_and_created_by(tmp_path):
     )
     conn.commit()
 
-    # Starting from Presenter with direction=both should show both directions
+    # Starting from Presenter with direction=both should show creates edges in both directions
     graph = get_entity_graph(
         conn,
         None,
@@ -920,9 +921,9 @@ def test_direction_both_shows_creates_and_created_by(tmp_path):
     edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
     node_names = {node["name"] for node in graph["nodes"]}
     
-    # Should have both createdBy (upstream) and creates (downstream)
-    assert ("Presenter", "Assembly", "createdBy") in edge_set
-    assert ("Presenter", "ViewModel", "creates") in edge_set
+    # Should have creates edges in both directions (all use "creates" type)
+    assert ("Assembly", "Presenter", "creates") in edge_set  # Upstream
+    assert ("Presenter", "ViewModel", "creates") in edge_set  # Downstream
     assert "Assembly" in node_names
     assert "Presenter" in node_names
     assert "ViewModel" in node_names
