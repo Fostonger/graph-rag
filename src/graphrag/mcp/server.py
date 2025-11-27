@@ -123,18 +123,23 @@ async def handle_list_tools() -> list[Tool]:
                     "include_sibling_subgraphs": {
                         "type": "boolean",
                         "default": False,
-                        "description": "If true, expand sibling nodes beyond a single hop.",
+                        "description": "Deprecated. Kept for compatibility.",
                     },
                     "max_hops": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Reference traversal depth limit.",
+                        "description": "Maximum traversal depth from the root entity.",
                     },
                     "targetType": {
                         "type": "string",
                         "enum": ["app", "test", "all"],
                         "default": "app",
                         "description": "Filter nodes by target type.",
+                    },
+                    "stop_at_module_boundary": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, entities from different modules become leaf nodes (not traversed further).",
                     },
                 },
                 "required": ["entity"],
@@ -185,6 +190,7 @@ async def handle_call_tool(
         else:
             max_hops = int(max_hops_arg)
         target_type = (arguments.get("targetType") or "app").lower()
+        stop_at_module_boundary = bool(arguments.get("stop_at_module_boundary", False))
 
         payload = service.get_graph(
             entity_name=entity,
@@ -193,6 +199,7 @@ async def handle_call_tool(
             include_sibling_subgraphs=include_siblings,
             max_hops=max_hops,
             target_type=target_type,
+            stop_at_module_boundary=stop_at_module_boundary,
         )
         return [_json_text({"tool": name, "graph": payload})]
 

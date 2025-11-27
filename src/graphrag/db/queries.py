@@ -188,6 +188,7 @@ def get_entity_graph(
     max_hops: Optional[int] = None,
     target_type: str = "app",
     use_fast_path: bool = False,
+    stop_at_module_boundary: bool = False,
 ) -> dict:
     """Build a graph centered on the specified entity.
     
@@ -197,10 +198,11 @@ def get_entity_graph(
         entity_name: Name of the entity to center the graph on
         stop_name: Optional entity name to stop traversal at
         direction: Graph traversal direction (upstream, downstream, both)
-        include_sibling_subgraphs: Include sibling entity subgraphs
+        include_sibling_subgraphs: Include sibling entity subgraphs (deprecated, kept for compatibility)
         max_hops: Maximum number of hops from start entity
         target_type: Filter by target type (app, test, all)
         use_fast_path: Use materialized views for faster loading (master only)
+        stop_at_module_boundary: If True, entities from different modules become leaf nodes
     
     Returns:
         Graph payload with nodes and edges
@@ -265,9 +267,11 @@ def get_entity_graph(
         direction=direction,
         include_siblings=include_sibling_subgraphs,
         max_hops=max_hops,
+        stop_at_module_boundary=stop_at_module_boundary,
     )
     graph_payload["target_type_filter"] = target_type
     graph_payload["max_hops"] = max_hops
+    graph_payload["stop_at_module_boundary"] = stop_at_module_boundary
     return graph_payload
 
 
@@ -1279,12 +1283,25 @@ def _build_graph_payload(
     direction: str,
     include_siblings: bool,
     max_hops: Optional[int],
+    stop_at_module_boundary: bool = False,
 ) -> dict:
+    """Build graph payload using unified BFS that respects max_hops for all edge types.
+    
+    Args:
+        entities: All entities keyed by stable_id
+        relationships: All relationships
+        start_node: The starting entity
+        stop_node: Optional entity to stop traversal at
+        direction: 'upstream', 'downstream', or 'both'
+        include_siblings: Deprecated, kept for compatibility
+        max_hops: Maximum traversal depth from start entity
+        stop_at_module_boundary: If True, entities from different modules become leaf nodes
+    """
     start_id = start_node["stable_id"]
+    start_module = start_node.get("module")
     stop_id = stop_node["stable_id"] if stop_node else None
-    nodes_included: set[str] = set()
-    edges_payload: List[dict] = []
-    edge_keys: set[Tuple[Any, ...]] = set()
+    
+    # Categorize relationships for quick lookup
     (
         creates_by_child,
         creates_by_parent,
@@ -1292,84 +1309,101 @@ def _build_graph_payload(
         reference_edges,
     ) = _categorize_relationships(relationships)
 
+    # Build incoming reference lookup
     incoming_refs: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for rel in reference_edges:
         target_id = rel.get("target_stable_id")
         if target_id:
             incoming_refs[target_id].append(rel)
 
-    focus_nodes = _collect_focus_nodes(start_id, stop_id, creates_by_child)
-    display_nodes = set(focus_nodes)
-    for rel in reference_edges:
-        source_id = rel["source_stable_id"]
-        target_id = rel.get("target_stable_id")
-        if (source_id and source_id in focus_nodes) or (
-            target_id and target_id in focus_nodes
-        ):
-            if source_id:
-                display_nodes.add(source_id)
-            if target_id:
-                display_nodes.add(target_id)
-
-    nodes_included: set[str] = set()
-    edge_keys: set[Tuple[Any, ...]] = set()
+    # Unified BFS traversal
+    nodes_included: Set[str] = set()
     edges_payload: List[dict] = []
-
-    if include_siblings:
+    edge_keys: Set[Tuple[Any, ...]] = set()
+    
+    # Track which nodes are leaf nodes (at module boundary)
+    leaf_nodes: Set[str] = set()
+    
+    # BFS queue: (node_id, depth)
+    queue: deque[Tuple[str, int]] = deque([(start_id, 0)])
+    visited: Set[str] = set()
+    
+    while queue:
+        node_id, depth = queue.popleft()
+        
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        
+        # Skip if this is the stop node
+        if node_id == stop_id:
+            continue
+        
+        # Add node to included set
+        nodes_included.add(node_id)
+        
+        # Check max_hops limit - if at limit, this node is a leaf (no edges processed)
+        at_hop_limit = max_hops is not None and depth >= max_hops
+        if at_hop_limit:
+            continue  # Node is included but we don't process its edges
+        
+        # Check if we should stop traversal at this node (module boundary)
+        node_entity = entities.get(node_id)
+        is_at_boundary = False
+        if stop_at_module_boundary and node_entity:
+            node_module = node_entity.get("module")
+            # If module differs from start and this isn't the start node, mark as leaf
+            if node_id != start_id and node_module != start_module:
+                is_at_boundary = True
+                leaf_nodes.add(node_id)
+                continue  # Node is included but we don't process its edges
+        
+        # Process edges based on direction
+        # DOWNSTREAM: outgoing reference edges + creates edges (what this entity creates)
         if direction in {"downstream", "both"}:
-            _append_reference_edges_full(
-                start_id,
-                refs_outgoing,
-                incoming_refs,
-                display_nodes,
-                entities,
-                edges_payload,
-                edge_keys,
-                nodes_included,
-                stop_id,
-                max_hops,
-            )
-        _attach_created_by_edges(
-            display_nodes,
-            creates_by_child,
-            entities,
-            edges_payload,
-            edge_keys,
-            nodes_included,
-            stop_id,
-        )
-    else:
-        _attach_created_by_edges(
-            display_nodes,
-            creates_by_child,
-            entities,
-            edges_payload,
-            edge_keys,
-            nodes_included,
-            stop_id,
-        )
-        if direction in {"downstream", "both"}:
-            _append_reference_edges_limited(
-                refs_outgoing,
-                incoming_refs,
-                focus_nodes,
-                entities,
-                edges_payload,
-                edge_keys,
-                nodes_included,
-                stop_id,
-                max_hops,
-            )
-
-    if direction in {"upstream", "both"} and not include_siblings:
-        # ensure ancestor nodes stay visible even when no edges were added
-        for node_id in focus_nodes:
-            if node_id != stop_id:
-                nodes_included.add(node_id)
-
-    if start_id not in nodes_included and (not stop_id or start_id != stop_id):
-        nodes_included.add(start_id)
-
+            # Outgoing reference edges
+            for rel in refs_outgoing.get(node_id, []):
+                target_id = rel.get("target_stable_id")
+                _append_edge_unified(
+                    rel, entities, edges_payload, edge_keys, nodes_included, stop_id
+                )
+                # Queue target for traversal (unless it's stop node or already visited)
+                if target_id and target_id not in visited and target_id != stop_id:
+                    queue.append((target_id, depth + 1))
+            
+            # Creates edges (downstream = what this entity creates)
+            for rel in creates_by_parent.get(node_id, []):
+                child_id = rel.get("target_stable_id")
+                _append_creates_edge(
+                    rel, entities, edges_payload, edge_keys, nodes_included, stop_id
+                )
+                # Queue child for traversal (unless it's stop node or already visited)
+                if child_id and child_id not in visited and child_id != stop_id:
+                    queue.append((child_id, depth + 1))
+        
+        # UPSTREAM: incoming reference edges + createdBy edges (who created this entity)
+        if direction in {"upstream", "both"}:
+            # Incoming reference edges
+            for rel in incoming_refs.get(node_id, []):
+                source_id = rel.get("source_stable_id")
+                _append_edge_unified(
+                    rel, entities, edges_payload, edge_keys, nodes_included, stop_id
+                )
+                # Queue source for traversal (unless it's stop node or already visited)
+                if source_id and source_id not in visited and source_id != stop_id:
+                    queue.append((source_id, depth + 1))
+            
+            # CreatedBy edges (upstream = who created this entity)
+            for rel in creates_by_child.get(node_id, []):
+                parent_id = rel.get("source_stable_id")
+                _append_created_by_edge(
+                    rel, entities, edges_payload, edge_keys, nodes_included, stop_id
+                )
+                # Queue parent for traversal (unless it's stop node or already visited)
+                if parent_id and parent_id not in visited and parent_id != stop_id:
+                    queue.append((parent_id, depth + 1))
+    
+    # Add structural edges (superclass, conforms) for all included nodes
     _attach_structural_edges(
         reference_edges,
         nodes_included,
@@ -1379,6 +1413,7 @@ def _build_graph_payload(
         stop_id,
     )
 
+    # Build node payloads
     visible_nodes = [sid for sid in nodes_included if sid in entities]
     node_payloads = [
         _serialize_node(entities[sid])
@@ -1420,6 +1455,80 @@ def _categorize_relationships(
             refs_outgoing[rel["source_stable_id"]].append(rel)
             references.append(rel)
     return creates_by_child, creates_by_parent, refs_outgoing, references
+
+
+def _append_edge_unified(
+    rel: Dict[str, Any],
+    entities: Dict[str, dict],
+    edges: List[dict],
+    edge_keys: Set[Tuple[Any, ...]],
+    nodes: Set[str],
+    stop_id: Optional[str],
+) -> None:
+    """Append a reference edge (non-creates) to the edges list."""
+    key = (
+        rel["source_stable_id"],
+        rel.get("target_stable_id"),
+        rel["target_name"],
+        rel["edge_type"],
+    )
+    if key in edge_keys:
+        return
+    edge_keys.add(key)
+    metadata = dict(rel.get("metadata") or {})
+    metadata["origin"] = rel["origin"]
+    edge = {
+        "type": rel["edge_type"],
+        "source": _entity_label(
+            entities, rel["source_stable_id"], rel["source_name"]
+        ),
+        "target": _entity_label(
+            entities,
+            rel.get("target_stable_id"),
+            rel.get("target_entity_name") or rel["target_name"],
+        ),
+        "metadata": metadata,
+    }
+    edges.append(edge)
+    _add_node(nodes, rel["source_stable_id"], stop_id)
+    target_id = rel.get("target_stable_id")
+    if target_id:
+        _add_node(nodes, target_id, stop_id)
+
+
+def _append_creates_edge(
+    rel: Dict[str, Any],
+    entities: Dict[str, dict],
+    edges: List[dict],
+    edge_keys: Set[Tuple[Any, ...]],
+    nodes: Set[str],
+    stop_id: Optional[str],
+) -> None:
+    """Append a creates edge (downstream direction: parent creates child)."""
+    parent_id = rel["source_stable_id"]
+    child_id = rel.get("target_stable_id")
+    key = (
+        "creates",
+        parent_id,
+        child_id or rel["target_name"],
+    )
+    if key in edge_keys:
+        return
+    edge_keys.add(key)
+    metadata = dict(rel.get("metadata") or {})
+    metadata["origin"] = rel["origin"]
+    edge = {
+        "type": "creates",
+        "source": _entity_label(entities, parent_id, rel["source_name"]),
+        "target": _entity_label(
+            entities, child_id, rel.get("target_entity_name") or rel["target_name"]
+        ),
+        "metadata": metadata,
+    }
+    edges.append(edge)
+    _add_node(nodes, parent_id, stop_id)
+    if child_id:
+        _add_node(nodes, child_id, stop_id)
 
 
 def _collect_focus_nodes(

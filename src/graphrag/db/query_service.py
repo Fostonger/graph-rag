@@ -58,11 +58,21 @@ class QueryService:
         include_sibling_subgraphs: bool = False,
         max_hops: Optional[int] = None,
         target_type: str = "app",
+        stop_at_module_boundary: bool = False,
     ) -> dict:
         """Build a graph centered on the specified entity.
         
         Automatically determines whether to use the feature database overlay
         based on the current git branch state.
+        
+        Args:
+            entity_name: Name of the entity to center the graph on
+            stop_name: Optional entity name to stop traversal at
+            direction: Graph traversal direction (upstream, downstream, both)
+            include_sibling_subgraphs: Deprecated, kept for compatibility
+            max_hops: Maximum number of hops from start entity
+            target_type: Filter by target type (app, test, all)
+            stop_at_module_boundary: If True, entities from different modules become leaf nodes
         """
         feature_conn: Optional[sqlite3.Connection] = None
         with get_connection(self.settings.db_path) as master_conn:
@@ -82,6 +92,7 @@ class QueryService:
                     include_sibling_subgraphs=include_sibling_subgraphs,
                     max_hops=max_hops,
                     target_type=target_type,
+                    stop_at_module_boundary=stop_at_module_boundary,
                 )
             finally:
                 if feature_conn is not None:

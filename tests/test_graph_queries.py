@@ -162,7 +162,8 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
     assert ("MyModuleViewController", "MyModuleAssembly", "createdBy") in edge_set
     assert ("MyModulePresenter", "MyModuleAssembly", "createdBy") in edge_set
     assert ("MyModuleViewController", "MyModulePresenter", "strongReference") in edge_set
-    assert ("MyModulePresenter", "NetworkWorker", "strongReference") not in edge_set
+    # With unified BFS, NetworkWorker is now correctly reachable via Presenter
+    assert ("MyModulePresenter", "NetworkWorker", "strongReference") in edge_set
     assert ("MyModulePresenter", "BasePresenter", "superclass") in edge_set
     assert ("MyModuleViewController", "ViewInput", "conforms") in edge_set
 
@@ -171,18 +172,21 @@ def test_get_entity_graph_merges_master_and_feature(tmp_path):
     )
     assert weak_edge["metadata"]["origin"] == "feature"
 
-    expanded_graph = get_entity_graph(
+    # With max_hops=1, only immediate neighbors should be included
+    limited_graph = get_entity_graph(
         master_conn,
         feature_conn,
         entity_name="MyModuleViewController",
         stop_name="MyModuleAssembly",
-        include_sibling_subgraphs=True,
+        max_hops=1,
     )
-    expanded_edges = {
+    limited_edges = {
         (edge["source"], edge["target"], edge["type"])
-        for edge in expanded_graph["edges"]
+        for edge in limited_graph["edges"]
     }
-    assert ("MyModulePresenter", "NetworkWorker", "strongReference") in expanded_edges
+    # NetworkWorker is 2 hops from View (View -> Presenter -> NetworkWorker)
+    # so with max_hops=1 it should not be included
+    assert ("MyModulePresenter", "NetworkWorker", "strongReference") not in limited_edges
 
     node_names = {node["name"] for node in graph["nodes"]}
     assert "MyModuleAssembly" not in node_names
@@ -283,6 +287,7 @@ def test_get_entity_graph_applies_feature_deletions(tmp_path):
 
 
 def test_get_entity_graph_limits_hops(tmp_path):
+    """Test that max_hops limits traversal depth for reference edges."""
     conn = sqlite3.connect(tmp_path / "hops.db")
     conn.row_factory = sqlite3.Row
     schema.apply_schema(conn)
@@ -312,19 +317,25 @@ def test_get_entity_graph_limits_hops(tmp_path):
     )
     conn.commit()
 
+    # max_hops=1 should only include A and B, not C
     limited_graph = get_entity_graph(
         conn,
         None,
         entity_name="EntityA",
-        include_sibling_subgraphs=True,
+        direction="downstream",
         max_hops=1,
     )
     limited_edges = {
         (edge["source"], edge["target"], edge["type"])
         for edge in limited_graph["edges"]
     }
-    assert ("EntityB", "EntityC", "strongReference") not in limited_edges
+    node_names = {node["name"] for node in limited_graph["nodes"]}
+    
     assert ("EntityA", "EntityB", "strongReference") in limited_edges
+    assert ("EntityB", "EntityC", "strongReference") not in limited_edges
+    assert "EntityA" in node_names
+    assert "EntityB" in node_names
+    assert "EntityC" not in node_names
 
 
 def test_get_entity_graph_zero_hops_removes_references(tmp_path):
@@ -707,6 +718,351 @@ def test_load_relationships_handles_null_target(tmp_path):
     assert len(external_refs) == 1
     assert external_refs[0]["target_entity_id"] is None
     assert external_refs[0]["target_stable_id"] is None
+    conn.close()
+
+
+# ============================================================================
+# New Unified BFS Tests - max_hops, direction, module boundary
+# ============================================================================
+
+
+def test_max_hops_limits_creates_edges(tmp_path):
+    """Test that max_hops limits traversal depth including creates edges."""
+    conn = sqlite3.connect(tmp_path / "creates-hops.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Create a hierarchy: Assembly creates Presenter creates ViewModel
+    assembly = _entity("Assembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("Presenter", "presenter", "Sources/Presenter.swift")
+    viewmodel = _entity("ViewModel", "viewmodel", "Sources/ViewModel.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("creates-hops", None, "master", True)
+    entity_map = repo.persist_entities(commit, [assembly, presenter, viewmodel])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=viewmodel.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # With max_hops=1, starting from Assembly downstream, should only get Presenter
+    graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Assembly",
+        direction="downstream",
+        max_hops=1,
+    )
+    
+    node_names = {node["name"] for node in graph["nodes"]}
+    edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
+    
+    assert "Assembly" in node_names
+    assert "Presenter" in node_names
+    assert "ViewModel" not in node_names
+    assert ("Assembly", "Presenter", "creates") in edge_set
+    conn.close()
+
+
+def test_direction_downstream_shows_creates(tmp_path):
+    """Test that direction=downstream shows what entity creates."""
+    conn = sqlite3.connect(tmp_path / "dir-downstream.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    assembly = _entity("Assembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("Presenter", "presenter", "Sources/Presenter.swift")
+    view = _entity("View", "view", "Sources/View.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("dir-down", None, "master", True)
+    entity_map = repo.persist_entities(commit, [assembly, presenter, view])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=view.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # Starting from Assembly with direction=downstream should show creates edges
+    graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Assembly",
+        direction="downstream",
+    )
+    
+    edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
+    node_names = {node["name"] for node in graph["nodes"]}
+    
+    # Should have creates edges going out from Assembly
+    assert ("Assembly", "Presenter", "creates") in edge_set
+    assert ("Assembly", "View", "creates") in edge_set
+    assert "Assembly" in node_names
+    assert "Presenter" in node_names
+    assert "View" in node_names
+    conn.close()
+
+
+def test_direction_upstream_shows_created_by(tmp_path):
+    """Test that direction=upstream shows who created the entity."""
+    conn = sqlite3.connect(tmp_path / "dir-upstream.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    assembly = _entity("Assembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("Presenter", "presenter", "Sources/Presenter.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("dir-up", None, "master", True)
+    entity_map = repo.persist_entities(commit, [assembly, presenter])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # Starting from Presenter with direction=upstream should show createdBy edge
+    graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Presenter",
+        direction="upstream",
+    )
+    
+    edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
+    node_names = {node["name"] for node in graph["nodes"]}
+    
+    # Should have createdBy edge (Presenter <- Assembly)
+    assert ("Presenter", "Assembly", "createdBy") in edge_set
+    assert "Presenter" in node_names
+    assert "Assembly" in node_names
+    conn.close()
+
+
+def test_direction_both_shows_creates_and_created_by(tmp_path):
+    """Test that direction=both shows both creates and createdBy edges."""
+    conn = sqlite3.connect(tmp_path / "dir-both.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    assembly = _entity("Assembly", "assembly", "Sources/Assembly.swift")
+    presenter = _entity("Presenter", "presenter", "Sources/Presenter.swift")
+    viewmodel = _entity("ViewModel", "viewmodel", "Sources/ViewModel.swift")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("dir-both", None, "master", True)
+    entity_map = repo.persist_entities(commit, [assembly, presenter, viewmodel])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=assembly.stable_id,
+                target_name=presenter.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=viewmodel.name,
+                edge_type="creates",
+                target_module="MyModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # Starting from Presenter with direction=both should show both directions
+    graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Presenter",
+        direction="both",
+    )
+    
+    edge_set = {(e["source"], e["target"], e["type"]) for e in graph["edges"]}
+    node_names = {node["name"] for node in graph["nodes"]}
+    
+    # Should have both createdBy (upstream) and creates (downstream)
+    assert ("Presenter", "Assembly", "createdBy") in edge_set
+    assert ("Presenter", "ViewModel", "creates") in edge_set
+    assert "Assembly" in node_names
+    assert "Presenter" in node_names
+    assert "ViewModel" in node_names
+    conn.close()
+
+
+def _entity_with_module(
+    name: str, stable_id: str, path: str, module: str, target_type: str = "app"
+) -> EntityRecord:
+    """Create an entity with a specific module for testing."""
+    return EntityRecord(
+        name=name,
+        kind="class",
+        module=module,
+        language="swift",
+        file_path=Path(path),
+        start_line=1,
+        end_line=5,
+        signature=f"class {name}",
+        code=f"class {name} {{}}",
+        stable_id=stable_id,
+        target_type=target_type,
+        members=[],
+    )
+
+
+def test_stop_at_module_boundary(tmp_path):
+    """Test that stop_at_module_boundary makes entities from different modules leaf nodes."""
+    conn = sqlite3.connect(tmp_path / "module-boundary.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Create entities in different modules
+    presenter = _entity_with_module("Presenter", "presenter", "Sources/Presenter.swift", "FeatureModule")
+    service = _entity_with_module("Service", "service", "Sources/Service.swift", "CoreModule")
+    deep = _entity_with_module("DeepDependency", "deep", "Sources/Deep.swift", "CoreModule")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("module-test", None, "master", True)
+    entity_map = repo.persist_entities(commit, [presenter, service, deep])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=presenter.stable_id,
+                target_name=service.name,
+                edge_type="strongReference",
+                target_module="CoreModule",
+            ),
+            RelationshipRecord(
+                source_stable_id=service.stable_id,
+                target_name=deep.name,
+                edge_type="strongReference",
+                target_module="CoreModule",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # Without stop_at_module_boundary, should traverse all
+    full_graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Presenter",
+        direction="downstream",
+        stop_at_module_boundary=False,
+    )
+    full_nodes = {node["name"] for node in full_graph["nodes"]}
+    assert "Presenter" in full_nodes
+    assert "Service" in full_nodes
+    assert "DeepDependency" in full_nodes
+    
+    # With stop_at_module_boundary, Service should be a leaf (not traversed further)
+    bounded_graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="Presenter",
+        direction="downstream",
+        stop_at_module_boundary=True,
+    )
+    bounded_nodes = {node["name"] for node in bounded_graph["nodes"]}
+    bounded_edges = {(e["source"], e["target"], e["type"]) for e in bounded_graph["edges"]}
+    
+    assert "Presenter" in bounded_nodes
+    assert "Service" in bounded_nodes  # Service should be included as leaf
+    assert "DeepDependency" not in bounded_nodes  # But not traversed further
+    assert ("Presenter", "Service", "strongReference") in bounded_edges
+    assert ("Service", "DeepDependency", "strongReference") not in bounded_edges
+    conn.close()
+
+
+def test_max_hops_with_module_boundary(tmp_path):
+    """Test that max_hops and stop_at_module_boundary work together."""
+    conn = sqlite3.connect(tmp_path / "hops-module.db")
+    conn.row_factory = sqlite3.Row
+    schema.apply_schema(conn)
+    
+    # Same module chain: A -> B -> C
+    a = _entity_with_module("EntityA", "a", "Sources/A.swift", "ModuleX")
+    b = _entity_with_module("EntityB", "b", "Sources/B.swift", "ModuleX")
+    c = _entity_with_module("EntityC", "c", "Sources/C.swift", "ModuleX")
+    
+    repo = MetadataRepository(conn)
+    commit = repo.record_commit("hops-module", None, "master", True)
+    entity_map = repo.persist_entities(commit, [a, b, c])
+    repo.persist_relationships(
+        commit,
+        entity_map,
+        [
+            RelationshipRecord(
+                source_stable_id=a.stable_id,
+                target_name=b.name,
+                edge_type="strongReference",
+                target_module="ModuleX",
+            ),
+            RelationshipRecord(
+                source_stable_id=b.stable_id,
+                target_name=c.name,
+                edge_type="strongReference",
+                target_module="ModuleX",
+            ),
+        ],
+    )
+    conn.commit()
+
+    # With max_hops=2, should include all (same module, no boundary)
+    graph = get_entity_graph(
+        conn,
+        None,
+        entity_name="EntityA",
+        direction="downstream",
+        max_hops=2,
+        stop_at_module_boundary=True,
+    )
+    nodes = {node["name"] for node in graph["nodes"]}
+    
+    assert "EntityA" in nodes
+    assert "EntityB" in nodes
+    assert "EntityC" in nodes  # Same module, within max_hops
     conn.close()
 
 
