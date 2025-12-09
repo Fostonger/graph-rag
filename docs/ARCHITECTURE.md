@@ -38,16 +38,16 @@ src/graphrag/
 - This metadata is persisted in `entity_versions.properties` so downstream
   queries can filter out unit-test-only code paths.
 
-### Graph traversal defaults
+### SCIP-based navigation
 
-- The `graph` block in `config.yaml` controls which build system integration to
-  use and sets the default `max_hops` used by the MCP server when expanding
-  reference edges.
-- `get_graph` enforces the hop limit for sibling-subgraph traversals, greatly
-  reducing large call graphs on huge repositories.
-- Clients can supply `targetType` (`app`, `test`, or `all`) to remove unwanted
-  code paths, and the response includes the filter + hop settings that were
-  applied.
+The MCP server provides IDE-like code navigation tools:
+- `go_to_definition` - Find symbol definitions with inheritance info
+- `find_references` - Find all usages of a symbol
+- `find_implementations` - Find protocol/interface implementations
+- `search_symbols` - Search symbols by name with wildcards
+
+These tools are backed by SCIP (Source Code Index Protocol) data stored in
+the `symbols`, `occurrences`, and `symbol_relationships` tables.
 
 ### Future GraphRAG expansion
 

@@ -1,14 +1,8 @@
-repo_path: .
-db_path: graphrag.db
-feature_db_path: graphrag-feature.db
-default_branch: master
-languages:
-  - swift
-parser:
-  swift:
-    enable_extensions: true
-    include_doc_comments: true
-graph:
-  build_system: tuist
-  max_hops: 2
+# GraphRAG configuration
+# The database is created by an external indexer (e.g., swift-scip-indexer)
 
+# Path to repository (for context/reference)
+repo_path: .
+
+# Path to external indexer SQLite database
+db_path: index.db

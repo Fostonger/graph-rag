@@ -1,3 +1,11 @@
+"""MCP server for code navigation queries.
+
+Provides IDE-like navigation tools over external indexer databases:
+- go_to_definition: Find symbol definitions
+- find_references: Find all symbol usages
+- find_implementations: Find protocol implementations
+- search_symbols: Search symbols by name
+"""
 from __future__ import annotations
 
 import argparse
@@ -22,15 +30,12 @@ def _resolve_settings(
     config: Optional[Path],
     repo: Optional[Path],
     db: Optional[Path],
-    feature_db: Optional[Path],
 ) -> Settings:
     settings = load_settings(config)
     if repo:
         settings.repo_path = Path(repo).expanduser().resolve()
     if db:
         settings.db_path = Path(db).expanduser().resolve()
-    if feature_db:
-        settings.feature_db_path = Path(feature_db).expanduser().resolve()
     return settings
 
 
@@ -49,100 +54,102 @@ def _get_query_service() -> QueryService:
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(
-            name="find_entities",
-            description="Look up entities by name/module/path and return metadata (optionally code).",
+            name="go_to_definition",
+            description="Find the definition of a symbol. Returns the file location, code snippet, inheritance info, and members.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to find (e.g., 'FeaturePresenter', 'viewDidLoad').",
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Optional file path for context (helps disambiguate overloaded names).",
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Optional line number for context (finds the specific symbol at that location).",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="find_references",
+            description="Find all usages/references of a symbol across the codebase.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to find references for.",
+                    },
+                    "include_definitions": {
+                        "type": "boolean",
+                        "description": "If true, include definition occurrences in results.",
+                        "default": False,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of references to return.",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 200,
+                    },
+                },
+                "required": ["symbol"],
+            },
+        ),
+        Tool(
+            name="find_implementations",
+            description="Find all implementations of a protocol/interface. Shows which types conform to a protocol.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "protocol": {
+                        "type": "string",
+                        "description": "Protocol/interface name to find implementations for.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of implementations to return.",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 200,
+                    },
+                },
+                "required": ["protocol"],
+            },
+        ),
+        Tool(
+            name="search_symbols",
+            description="Search for symbols by name. Supports wildcards (*) for pattern matching.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Entity name or fragment to search for.",
+                        "description": "Search query. Use * for wildcards (e.g., 'Feature*', '*Presenter').",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["class", "struct", "protocol", "enum", "function", "property"],
+                        "description": "Filter by symbol kind.",
+                    },
+                    "module": {
+                        "type": "string",
+                        "description": "Filter by module name.",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max number of entities to return.",
+                        "description": "Maximum results to return.",
                         "default": 25,
                         "minimum": 1,
-                        "maximum": 200,
-                    },
-                    "include_code": {
-                        "type": "boolean",
-                        "description": "If true, include entity code snippets.",
-                        "default": False,
+                        "maximum": 100,
                     },
                 },
                 "required": ["query"],
-            },
-        ),
-        Tool(
-            name="get_members",
-            description="Fetch member details for specific entities (functions/properties/etc).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entities": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "description": "List of entity names.",
-                    },
-                    "members": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Subset of member names to filter (optional).",
-                    },
-                    "include_code": {
-                        "type": "boolean",
-                        "description": "Include member implementation code.",
-                        "default": True,
-                    },
-                },
-                "required": ["entities"],
-            },
-        ),
-        Tool(
-            name="get_graph",
-            description="Return upstream/downstream dependency graph for a Swift entity.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "entity": {
-                        "type": "string",
-                        "description": "Entity name serving as the graph root.",
-                    },
-                    "stop_at": {
-                        "type": "string",
-                        "description": "Ancestor/superclass name that caps upstream traversal.",
-                    },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["upstream", "downstream", "both"],
-                        "default": "both",
-                        "description": "Traversal direction relative to the root.",
-                    },
-                    "include_sibling_subgraphs": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Deprecated. Kept for compatibility.",
-                    },
-                    "max_hops": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum traversal depth from the root entity.",
-                    },
-                    "targetType": {
-                        "type": "string",
-                        "enum": ["app", "test", "all"],
-                        "default": "app",
-                        "description": "Filter nodes by target type.",
-                    },
-                    "stop_at_module_boundary": {
-                        "type": "boolean",
-                        "default": True,
-                        "description": "If true, entities from different modules become leaf nodes (not traversed further).",
-                    },
-                },
-                "required": ["entity"],
             },
         ),
     ]
@@ -154,54 +161,55 @@ async def handle_call_tool(
 ) -> list[TextContent]:
     service = _get_query_service()
 
-    if name == "find_entities":
-        query = arguments.get("query", "")
+    if name == "go_to_definition":
+        symbol = arguments.get("symbol")
+        if not symbol:
+            raise ValueError("symbol is required")
+        
+        file_path = arguments.get("file")
+        line = arguments.get("line")
+        if line is not None:
+            line = int(line)
+        
+        result = service.go_to_definition(symbol, file_path, line)
+        
+        if result is None:
+            return [_json_text({"error": f"Symbol '{symbol}' not found"})]
+        
+        return [_json_text(result)]
+
+    if name == "find_references":
+        symbol = arguments.get("symbol")
+        if not symbol:
+            raise ValueError("symbol is required")
+        
+        include_definitions = bool(arguments.get("include_definitions", False))
+        limit = int(arguments.get("limit", 50))
+        
+        result = service.find_references(symbol, include_definitions, limit)
+        return [_json_text(result)]
+
+    if name == "find_implementations":
+        protocol = arguments.get("protocol")
+        if not protocol:
+            raise ValueError("protocol is required")
+        
+        limit = int(arguments.get("limit", 50))
+        
+        result = service.find_implementations(protocol, limit)
+        return [_json_text(result)]
+
+    if name == "search_symbols":
+        query = arguments.get("query")
+        if not query:
+            raise ValueError("query is required")
+        
+        kind = arguments.get("kind")
+        module = arguments.get("module")
         limit = int(arguments.get("limit", 25))
-        include_code = bool(arguments.get("include_code", False))
-
-        rows = service.find_entities(query, limit=limit, include_code=include_code)
-        return [_json_text({"tool": name, "count": len(rows), "entities": rows})]
-
-    if name == "get_members":
-        entities = arguments.get("entities") or []
-        members = arguments.get("members") or []
-        include_code = bool(arguments.get("include_code", True))
-
-        if not entities:
-            raise ValueError("entities array cannot be empty")
-
-        rows = service.get_members(
-            entity_names=entities,
-            member_filters=members,
-            include_code=include_code,
-        )
-        return [_json_text({"tool": name, "count": len(rows), "members": rows})]
-
-    if name == "get_graph":
-        entity = arguments.get("entity")
-        if not entity:
-            raise ValueError("entity is required")
-        stop_at = arguments.get("stop_at")
-        direction = arguments.get("direction", "both")
-        include_siblings = bool(arguments.get("include_sibling_subgraphs", False))
-        max_hops_arg = arguments.get("max_hops")
-        if max_hops_arg is None:
-            max_hops = runtime_settings.graph.max_hops if runtime_settings else None
-        else:
-            max_hops = int(max_hops_arg)
-        target_type = (arguments.get("targetType") or "app").lower()
-        stop_at_module_boundary = bool(arguments.get("stop_at_module_boundary", True))
-
-        payload = service.get_graph(
-            entity_name=entity,
-            stop_name=stop_at,
-            direction=direction,
-            include_sibling_subgraphs=include_siblings,
-            max_hops=max_hops,
-            target_type=target_type,
-            stop_at_module_boundary=stop_at_module_boundary,
-        )
-        return [_json_text({"tool": name, "graph": payload})]
+        
+        results = service.search_symbols(query, kind, module, limit)
+        return [_json_text({"count": len(results), "symbols": results})]
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -215,7 +223,7 @@ async def _main(settings: Settings) -> None:
             write_stream,
             InitializationOptions(
                 server_name="graphrag-mcp",
-                server_version="0.1.0",
+                server_version="1.0.0",  # Major version bump for external indexer
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
@@ -228,9 +236,7 @@ def run_server() -> None:
     parser = argparse.ArgumentParser(description="GraphRAG MCP server")
     parser.add_argument("--config", type=Path, help="Path to config.yaml")
     parser.add_argument("--repo", type=Path, help="Repository path override")
-    parser.add_argument("--db", type=Path, help="Database path override")
-    parser.add_argument("--feature-db", type=Path, help="Feature database override")
+    parser.add_argument("--db", type=Path, help="Path to external indexer database")
     args = parser.parse_args()
-    settings = _resolve_settings(args.config, args.repo, args.db, args.feature_db)
+    settings = _resolve_settings(args.config, args.repo, args.db)
     asyncio.run(_main(settings))
-

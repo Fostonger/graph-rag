@@ -1,174 +1,122 @@
-"""Tests for database connection configuration and optimizations."""
+"""Tests for database connection to external indexer databases."""
 
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from graphrag.db.connection import (
-    CACHE_SIZE_KB,
-    MMAP_SIZE_BYTES,
-    connect,
-    connect_readonly,
-    get_connection,
-    get_readonly_connection,
-)
-from graphrag.db.schema import apply_schema
+from graphrag.db.connection import connect, get_connection
+from graphrag.db.schema import SchemaError
+
+from conftest import create_external_indexer_db
 
 
-def test_connect_applies_performance_pragmas(tmp_path: Path):
-    """Verify that connect() applies all performance-related PRAGMAs."""
+def test_connect_opens_readonly(tmp_path: Path):
+    """Verify that connect() opens database in read-only mode."""
     db_path = tmp_path / "test.db"
+    create_external_indexer_db(db_path).close()
+    
     conn = connect(db_path)
     
     try:
-        # Check journal mode
-        result = conn.execute("PRAGMA journal_mode;").fetchone()
-        assert result[0].lower() == "wal"
-        
-        # Check synchronous mode
-        result = conn.execute("PRAGMA synchronous;").fetchone()
-        assert result[0] == 1  # NORMAL = 1
-        
-        # Check cache size (negative value means KB)
-        result = conn.execute("PRAGMA cache_size;").fetchone()
-        assert result[0] == -CACHE_SIZE_KB
-        
-        # Check mmap size (SQLite may round down for page alignment)
-        result = conn.execute("PRAGMA mmap_size;").fetchone()
-        assert result[0] >= MMAP_SIZE_BYTES * 0.99  # Allow small rounding
-        
-        # Check temp store
-        result = conn.execute("PRAGMA temp_store;").fetchone()
-        assert result[0] == 2  # MEMORY = 2
-        
-        # Check foreign keys enabled for read-write connections
-        result = conn.execute("PRAGMA foreign_keys;").fetchone()
-        assert result[0] == 1
-        
-        # Check row factory is set
-        assert conn.row_factory == sqlite3.Row
-    finally:
-        conn.close()
-
-
-def test_connect_creates_parent_directories(tmp_path: Path):
-    """Verify that connect() creates parent directories if needed."""
-    db_path = tmp_path / "nested" / "dirs" / "test.db"
-    assert not db_path.parent.exists()
-    
-    conn = connect(db_path)
-    conn.close()
-    
-    assert db_path.exists()
-    assert db_path.parent.exists()
-
-
-def test_connect_readonly_applies_performance_pragmas(tmp_path: Path):
-    """Verify that connect_readonly() applies read-optimized PRAGMAs."""
-    db_path = tmp_path / "test.db"
-    
-    # First create the database
-    write_conn = connect(db_path)
-    write_conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY);")
-    write_conn.commit()
-    write_conn.close()
-    
-    # Now open read-only
-    conn = connect_readonly(db_path)
-    
-    try:
-        # Check cache size
-        result = conn.execute("PRAGMA cache_size;").fetchone()
-        assert result[0] == -CACHE_SIZE_KB
-        
-        # Check mmap size (SQLite may round down for page alignment)
-        result = conn.execute("PRAGMA mmap_size;").fetchone()
-        assert result[0] >= MMAP_SIZE_BYTES * 0.99  # Allow small rounding
-        
-        # Check temp store
-        result = conn.execute("PRAGMA temp_store;").fetchone()
-        assert result[0] == 2  # MEMORY = 2
-        
-        # Check row factory is set
-        assert conn.row_factory == sqlite3.Row
-    finally:
-        conn.close()
-
-
-def test_connect_readonly_prevents_writes(tmp_path: Path):
-    """Verify that connect_readonly() opens database in read-only mode."""
-    db_path = tmp_path / "test.db"
-    
-    # Create the database with a table
-    write_conn = connect(db_path)
-    write_conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY);")
-    write_conn.commit()
-    write_conn.close()
-    
-    # Open read-only and try to write
-    conn = connect_readonly(db_path)
-    
-    try:
+        # Should fail to write
         with pytest.raises(sqlite3.OperationalError) as exc_info:
-            conn.execute("INSERT INTO test (id) VALUES (1);")
+            conn.execute("INSERT INTO metadata (key, value) VALUES ('test', 'value')")
         assert "readonly" in str(exc_info.value).lower()
     finally:
         conn.close()
 
 
-def test_connect_readonly_raises_for_missing_file(tmp_path: Path):
-    """Verify that connect_readonly() raises FileNotFoundError for missing DB."""
+def test_connect_sets_row_factory(tmp_path: Path):
+    """Verify that connect() sets row factory for dict-like access."""
+    db_path = tmp_path / "test.db"
+    create_external_indexer_db(db_path).close()
+    
+    conn = connect(db_path)
+    
+    try:
+        assert conn.row_factory == sqlite3.Row
+        
+        # Test dict-like access
+        row = conn.execute("SELECT key, value FROM metadata LIMIT 1").fetchone()
+        assert row["key"] is not None
+        assert row["value"] is not None
+    finally:
+        conn.close()
+
+
+def test_connect_raises_for_missing_file(tmp_path: Path):
+    """Verify that connect() raises FileNotFoundError for missing database."""
     db_path = tmp_path / "nonexistent.db"
     
     with pytest.raises(FileNotFoundError) as exc_info:
-        connect_readonly(db_path)
+        connect(db_path)
     
     assert "nonexistent.db" in str(exc_info.value)
 
 
+def test_connect_validates_schema_by_default(tmp_path: Path):
+    """Verify that connect() validates schema by default."""
+    db_path = tmp_path / "invalid.db"
+    
+    # Create an incomplete database
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    
+    with pytest.raises(SchemaError):
+        connect(db_path)
+
+
+def test_connect_can_skip_validation(tmp_path: Path):
+    """Verify that connect() can skip schema validation."""
+    db_path = tmp_path / "invalid.db"
+    
+    # Create an incomplete database
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    
+    # Should not raise with validate=False
+    conn = connect(db_path, validate=False)
+    conn.close()
+
+
 def test_get_connection_context_manager(tmp_path: Path):
-    """Verify that get_connection() context manager commits on success."""
+    """Verify that get_connection() context manager works correctly."""
     db_path = tmp_path / "test.db"
+    create_external_indexer_db(db_path).close()
     
     with get_connection(db_path) as conn:
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY);")
-        conn.execute("INSERT INTO test (id) VALUES (1);")
-    
-    # Verify data was committed
-    with get_connection(db_path) as conn:
-        result = conn.execute("SELECT id FROM test;").fetchone()
-        assert result["id"] == 1
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'version'").fetchone()
+        assert row["value"] == "1"
 
 
-def test_get_readonly_connection_context_manager(tmp_path: Path):
-    """Verify that get_readonly_connection() context manager works correctly."""
+def test_get_connection_closes_on_exit(tmp_path: Path):
+    """Verify that get_connection() closes connection on context exit."""
     db_path = tmp_path / "test.db"
+    create_external_indexer_db(db_path).close()
     
-    # Create database with data
     with get_connection(db_path) as conn:
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);")
-        conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello');")
+        pass
     
-    # Read using readonly connection
-    with get_readonly_connection(db_path) as conn:
-        result = conn.execute("SELECT value FROM test WHERE id = 1;").fetchone()
-        assert result["value"] == "hello"
+    # Connection should be closed - trying to use it should fail
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
 
 
-def test_connection_row_factory_returns_dict_like_rows(tmp_path: Path):
-    """Verify that row factory allows dict-like access to columns."""
+def test_connection_row_factory_dict_access(tmp_path: Path):
+    """Verify that rows support both index and key access."""
     db_path = tmp_path / "test.db"
+    create_external_indexer_db(db_path).close()
     
     with get_connection(db_path) as conn:
-        conn.execute("CREATE TABLE test (id INTEGER, name TEXT, value REAL);")
-        conn.execute("INSERT INTO test VALUES (1, 'foo', 3.14);")
+        row = conn.execute("SELECT key, value FROM metadata LIMIT 1").fetchone()
         
-        row = conn.execute("SELECT * FROM test;").fetchone()
+        # Index access
+        assert row[0] is not None
+        assert row[1] is not None
         
-        # Should support both index and key access
-        assert row[0] == 1
-        assert row["id"] == 1
-        assert row["name"] == "foo"
-        assert row["value"] == 3.14
-
+        # Key access
+        assert row["key"] is not None
+        assert row["value"] is not None
